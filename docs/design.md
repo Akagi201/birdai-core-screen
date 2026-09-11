@@ -154,19 +154,21 @@ database/systemd weight.**
 channel = "1.96.1"           # must match the Sui workspace
 
 # Cargo.toml  [workspace.dependencies]
-SUI_REV = "c8755d9c05209a22d91c07df76458992defd99c4"
-sui-types                 = { git = "https://github.com/MystenLabs/sui", rev = "c8755d9c05209a22d91c07df76458992defd99c4" }
-sui-package-resolver      = { git = "https://github.com/MystenLabs/sui", rev = "c8755d9c05209a22d91c07df76458992defd99c4" }
-sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "c8755d9c05209a22d91c07df76458992defd99c4" }
-sui-rpc-resolver          = { git = "https://github.com/MystenLabs/sui", rev = "c8755d9c05209a22d91c07df76458992defd99c4" }
-sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", rev = "c8755d9c05209a22d91c07df76458992defd99c4", default-features = false }
-move-core-types           = { git = "https://github.com/MystenLabs/sui", rev = "c8755d9c05209a22d91c07df76458992defd99c4" }
-move-binary-format        = { git = "https://github.com/MystenLabs/sui", rev = "c8755d9c05209a22d91c07df76458992defd99c4" }
+SUI_REV = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e"
+sui-types                 = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+sui-package-resolver      = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+sui-rpc-resolver          = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e", default-features = false }
+move-core-types           = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+move-binary-format        = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
 ```
 
 `move-core-types` and `move-binary-format` live in the same repository
 (`external-crates/move/crates/…`) and are workspace members, so a single git source covers everything;
-`Cargo.lock` is committed for reproducibility.
+`Cargo.lock` pins every transitive dependency for reproducibility (note: the workspace
+template `.gitignore`s the lock file, so a release that must reproduce bit-for-bit should
+commit it explicitly).
 
 ### Why `default-features = false` on the framework
 
@@ -887,7 +889,7 @@ mutation score reported.
 
 | Risk | Mitigation |
 |---|---|
-| Sui git dep build time / disk on a fresh clone | Pinned rev + committed `Cargo.lock`; `kache` wrapper; `[profile.dev.package."*"] opt-level = 2`; README states the one-time network requirement |
+| Sui git dep build time / disk on a fresh clone | Pinned rev + `Cargo.lock` pinning; `kache` wrapper; `[profile.dev.package."*"] opt-level = 2`; README states the one-time network requirement |
 | Public fullnode gRPC / GraphQL rate limits during a demo | Fixtures + `--offline`; the state manager takes a `RawObjectSource`, so the demo can replay a checkpoint file |
 | Public checkpoint object stores retain only ~30 days | Checkpoint `320577815` is fetched once and committed as a fixture |
 | Cetus package upgraded between research and grading | `calibrate` re-derives the fixed-point format from `S` and `tick`; typed decode is name-based; the layout cache is version-keyed |
@@ -914,6 +916,47 @@ mutation score reported.
 6. Do you want tick-level state indexed for **every** pool (653 nodes for this one alone) or only for
    pools inside your quoting set? §8.3 bounds it either way, but it is a memory/coverage trade-off you
    already have an opinion about.
+
+---
+
+## 14. rev 3 — what building it changed
+
+Every item below was found by running against mainnet, and each one contradicts something §1–§13
+asserts or assumes. They are recorded rather than quietly patched, because the wrong version is the
+plausible one.
+
+| # | § | rev 2 said | Reality | Fix |
+|---|---|---|---|---|
+| 13 | §6.1 | The swap entry is in the module that defines `T`. | **Cetus's `pool` module has no swap.** All 77 of its functions were scanned; none has the inter-asset shape. The entry that moved pool A is `0xae9c208c…::pool_script_v2::swap_b2a`, a sibling package. | The probe scans the defining package **and** resolves the `package::module::function` the chain executed, accepting a looser shape for the latter because script-style entries express the direction in a `bool` rather than in the types. `EntryEvidence::{StaticScan, ObservedCall}` records which applied. |
+| 14 | §8.3 | Venue identity is by `module::name`, so a new pool is picked up automatically. | Name alone is not identity: `follow` met 27 objects named `pool::Pool` from other packages with different layouts and failed to decode every one of them. | The name is a hint and the **resolved layout's field set** is the test (`layout_has_shape`). Collisions are counted as `unrecognised`, distinct from `failures`. |
+| 15 | §5.5, §8.3 | Children are re-associated with parents and the declared `size` is asserted. | A pool's children **cannot be read at a historical version**. T consumed pool A at version 995 150 484, which declares 650 ticks; enumerating today returns 653. | `Ticks::from_children` downgrades the size check to a reported `SizeSkew` while keeping every other invariant, and callers must handle the skew. See item 17 for why the quote does not need the tick set at all. |
+| 16 | §7.2, §7.4 | `sqrt_price_at_tick` is `⌊1.0001^(t/2)·2^64⌋` and tick nodes can be validated against it exactly. | Two of pool A's 654 nodes differ, by up to 7 units at `√P ≈ 7.9·10^28` (relative error under `2^-90`). Exhaustive search over Q128.128 with floor/round/ceil factor tables, truncating or ceiling the final narrowing, and an integer-square-root variant found **no** variant that reproduces every observed tick. | The on-chain values are authoritative; `sqrt_price_at_tick` is documented as approximate and validation uses a **relative** tolerance (`TICK_PRICE_TOLERANCE_BITS = 48`) with the deviation histogram reported. The swap math already used stored prices, so the reproduction was unaffected. |
+| 17 | §6.5 | The single step is proven by comparing `S'` against the next initialised tick. | That comparison needs the tick set, which item 15 shows is unavailable at a historical version. | The primary argument is now `tick_spacing`: a price move smaller than the spacing cannot reach another initialised tick, because initialised ticks lie on the spacing grid. `reproduce` quotes both with and without boundaries and asserts they agree. |
+| 18 | §2.2 | `default-features = false` on `sui-indexer-alt-framework` drops Diesel/Postgres. | It does not. `sui-indexer-alt-metrics` — a non-optional dependency of the framework — depends on `sui-pg-db` unconditionally, so Diesel, `diesel-async`, `diesel_migrations` and `tokio-postgres` are in the graph regardless. | The framework is still right, because nothing else ships hybrid streaming + backfill with retries and backpressure. The claim is corrected; the flag is kept because Sui's own root uses it. |
+| 19 | §7.3 | The CLMM math needs care around `U256`'s semantics. | `U256`'s `Add`/`Sub`/`Mul` **wrap** and `Div`/`Rem` panic on a zero divisor; the `checked_*` variants exist but nothing forces their use. | Arithmetic goes through a `CheckedU256` newtype that exposes only checked operations and converts failures into `AmmError`; it is the only way the crate touches a 256-bit value. |
+| 20 | §10 | Tests cover the golden numbers. | Three test *expectations* were wrong on first run: a rounding bound that ignored the magnitude of the truncated factors, a `nearest` tie point miscalculated, and a crossing case whose input was large enough to overflow. All three were fixed against measured data, not loosened. | The values that actually hold are recorded in the tests' comments. |
+| 21 | §2.2 | Dependency pinning is a build detail. | `allocative 0.3.6` moved to `hashbrown 0.16` while the Move package system's `starlark_map 0.13.0` uses `0.14.5`, so the derived `Allocative` impls stopped matching and `starlark_map` failed to compile. Sui's lock holds `allocative 0.3.4`. | `Cargo.lock` pins `allocative` to `0.3.4` with the reason recorded (see also item 29 for the nightly patch). A lock-file drift is a build failure, not a warning. |
+| 22 | §3.1 | `sui_rpc_resolver::RpcPackageStore` is the package-store backend. | It builds its own client from a URL, so it can carry neither an API key nor a fixture. | `SourcePackageStore<O>` implements `PackageStore` over any `ObjectSource` in fifteen lines. The resolver above it is untouched — which is precisely the point of `PackageStore` being a trait — and one source now serves objects, package bytecode and, if it ever exists, a validator's object store. |
+| 23 | §7.1 | `ObjectSource::objects` can be a batched RPC call. | `Client::batch_get_objects` collapses a **single** missing object into a wholesale error, and a missing object is not exotic: enumerating a pool's 650 tick nodes and fetching them afterwards leaves a window in which a tick is removed. This took a capture down. | Batch first for round-trip efficiency, then retry object by object and skip anything that is gone. The retry is in the source, so every caller inherits it. |
+| 24 | — | A fixture directory that does not exist can load as an empty set. | That turned a mistyped `--fixtures` path into "object not found" three commands later. | `Fixtures::load` requires the manifest and fails with `FixtureError::Missing` naming the directory. The committed-set tests skip explicitly on absence instead of relying on silent defaults. |
+| 25 | — | Hosted providers' Sui endpoints serve gRPC v2. | `shared.eu-central-1.getblock.io/<key>` answered every request with `Missing token-id` — with the key in the URL path, and in `x-api-key`, `x-token-id` and `Authorization: Bearer` in turn. | `--api-key` is supported (sending the first two plus a bearer token) because providers that *do* offer gRPC expect a header; the capture used Sui's own endpoints. Worth proving the keyed path against a provider that enables it. |
+| 26 | §4.1 | One endpoint is enough. | **Sui's two public mainnet endpoints are not interchangeable.** `fullnode.mainnet.sui.io` serves the whole API but keeps only a bounded window of checkpoints — `GetObject` succeeds while `GetCheckpoint` for checkpoint 320 577 815 returns transient `unavailable` or `NotFound`. `archive.mainnet.sui.io` keeps the full history but does **not** implement `StateService`: `ListDynamicFields` answers `Unimplemented`. | `GrpcObjectSource` holds a second client used only for `Checkpoint` reads, with a fallback to the primary on archival failure, and `--archive-url` (default `archive.mainnet.sui.io`, `""` to opt out). This is the same shape the validator variant takes — one source, several transports behind it — so it cost a field rather than a redesign. |
+| 27 | §10 | Mutation testing is future work. | `cargo mutants -p birdai-amm -p birdai-tick` (248 mutants): 204 caught, 38 unviable, 6 missed — and the 6 split into 4 equivalent-by-construction plus 2 real gaps. The gaps were a self-linking skip-list node (it resolves in the score map, so only the `!= position` half of the resolvability check rejects it) and a negative price deviation whose magnitude needs a subtraction (division collapses every small negative deviation to −1). | Both gaps now have killer tests; a scoped re-run over `birdai-tick/src/index.rs` reports 103 caught, 33 unviable, **0 missed**. The 4 equivalents (`delta_a`/`delta_b` `||`→`&&`, min-clamp `<`→`==`/`<=`) are pinned by in-code comments plus tests that lock the equivalence. Effective kill rate on killable mutants: 100%. |
+| 28 | §8.3 | A tick snapshot read over RPC is consistent. | It is not, on a live pool: listing the children is paginated and fetching them is a later round trip, so a tick added or removed in between leaves a snapshot whose link graph does not close. Online `reproduce` failed with `node 515776 links to 515836, which is not in the index` — the pool had grown new ticks since the fixtures were captured. Retrying the fetch alone cannot help, because the inconsistency is in the *listing*, not the fetch. | `load_tick_index` re-takes the whole snapshot once on any validation failure and only then fails loudly. Observed live: the retry fired (`node 508836 links to 508866`), the second snapshot validated, and the quote still matched the chain exactly. |
+| 29 | §2.2 | `just lint` passes as written. | It did not, for three reasons, all outside our code: (a) `allocative <= 0.3.5` fails on recent nightlies (duplicate `Allocative` impls for `!` vs `Infallible`, E0119), which reds the nightly-clippy step and CI with it; (b) `cargo workspace-inheritance-check --check` was never a valid flag — the tool checks by default; (c) 23 declared dependencies were dead (template leftovers like `config`/`rustls`, and refs removed by refactors such as `sui-rpc-resolver` after item 22). | (a) `third-party/allocative`: vendored 0.3.4 with exactly the redundant `!` impl deleted (stable never compiled it, so behaviour is unchanged there) plus warning fixes, wired via `[patch.crates-io]` kept last in the root manifest — a `[patch.*]` header ends the preceding table, so it must never be spliced into `[workspace.dependencies]`. (b) The Justfile recipe now calls the tool bare. (c) All 23 removed after grep-verifying zero uses; `cargo shear` is clean. |
+
+### Offline replay
+
+§2.2's "fixtures are designed but not committed" is closed: `cargo run -- fetch --out fixtures`
+captures 912 KB — pool A at three versions, B, C, 650 tick nodes, 8 packages, 4 layouts, and a
+filtered checkpoint — and `cargo run -- --fixtures fixtures <command>` replays any of them offline.
+The design constraint that made this cheap is that `ObjectSource` and `LayoutSource` were traits from
+the start: switching to `FixtureObjectSource`/`FixtureLayoutSource` changed one constructor, and every
+command works unchanged. `docs/design.md` §14 items 23–25 record the three bugs the replay exposed.
+
+Two things §1 got right and that carried the whole exercise: the Q64.64 derivation from
+`S / 1.0001^(tick/2)` — now the `calibrate` command — and the exact reproduction of transaction T
+from `L`, `S` and the fee alone (`Δ = 0`, asserted as a test rather than printed).
 
 ---
 

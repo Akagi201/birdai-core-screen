@@ -1,0 +1,21 @@
+[package]
+name = "birdai-venue"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+birdai-amm.workspace = true
+birdai-move.workspace = true
+birdai-resolve.workspace = true
+birdai-tick.workspace = true
+move-binary-format.workspace = true
+move-core-types.workspace = true
+sui-package-resolver.workspace = true
+sui-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

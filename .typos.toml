@@ -1,2 +1,6 @@
 [files]
-extend-exclude = ["specs/**"]
+extend-exclude = ["specs/**", "third-party/**"]
+
+[default.extend-words]
+# `Pn` is part of the real on-chain transaction digest F53RBSPn84e28FDWnunb7dykGTp7sNpzEnNUxG5h5fe7.
+Pn = "Pn"

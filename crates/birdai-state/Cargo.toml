@@ -1,0 +1,21 @@
+[package]
+name = "birdai-state"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+birdai-move.workspace = true
+birdai-resolve.workspace = true
+birdai-tick.workspace = true
+birdai-venue.workspace = true
+move-core-types.workspace = true
+rayon.workspace = true
+scc.workspace = true
+sui-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

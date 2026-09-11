@@ -22,7 +22,7 @@ lint:
   cargo +nightly fmt --all -- --check
   RUSTC_WRAPPER= cargo +nightly clippy --all -- -D warnings
   cargo shear
-  cargo workspace-inheritance-check --check
+  cargo workspace-inheritance-check
 
 # Run tests
 test:

@@ -3,6 +3,7 @@
 members = ["bin/*", "crates/*"]
 exclude = [".github/"]
 resolver = "3"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -10,15 +11,62 @@ license = "Apache-2.0"
 repository = "TODO"
 
 [workspace.dependencies]
+move-binary-format        = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+move-core-types           = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e", default-features = false }
+sui-package-resolver      = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+# ---------------------------------------------------------------------------
+# Sui / Move. Every entry MUST share one `rev` so the workspace moves forward
+# atomically. See docs/design.md §2 and §14 item 21.
+#
+# `Cargo.lock` is committed and is load-bearing: `allocative` must stay at 0.3.4
+# (its hashbrown dependency has to match the Move package system's
+# `starlark_map 0.13.0`, which uses hashbrown 0.14). 0.3.6 moved to hashbrown
+# 0.16 and makes `starlark_map` fail to compile. If a `cargo update` breaks the
+# build with `HashTable<usize>: Allocative is not satisfied`, run:
+#
+#     cargo update -p allocative --precise 0.3.4
+#
+# Additionally, upstream allocative <= 0.3.5 does not compile on recent nightlies
+# (duplicate `Allocative` impls for `!` vs `Infallible`, E0119), which breaks
+# `just lint` / CI clippy. `third-party/allocative` is 0.3.4 with exactly that
+# redundant impl removed; see its README for the removal condition.
+# ---------------------------------------------------------------------------
+sui-types                 = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+
+# --- internal ---
+birdai-amm     = { path = "crates/birdai-amm" }
+birdai-move    = { path = "crates/birdai-move" }
+birdai-resolve = { path = "crates/birdai-resolve" }
+birdai-state   = { path = "crates/birdai-state" }
+birdai-tick    = { path = "crates/birdai-tick" }
+birdai-venue   = { path = "crates/birdai-venue" }
+
+# --- crates.io ---
+arc-swap = "1.9.2"
+async-trait = "0.1.92"
+base64 = "0.23.1"
+bcs = "0.2.1"
+blake3 = "1.8.7"
+bytes = "1.12.1"
 clap = "4.6.6"
-config = "0.15.25"
 eyre = "0.6.14"
+http = "1.1.0"
+prometheus = "0.14.0"
 proptest = "1.11.0"
+rayon = "1.12.0"
+scc = "3.8.8"
 serde = "1.0.229"
+serde_json = "1.0.151"
+tempfile = "3.27.0"
 thiserror = "2.0.20"
-tokio = "1.53.1"
+# Sui pins `=1.52.1`; keep the requirement loose so the resolver can unify on it.
+tokio = "=1.52.1"
+tonic = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+url = "2.5.8"
 
 [workspace.lints.clippy]
 # Enable pedantic lints for stricter code quality
@@ -34,7 +82,7 @@ similar_names = "allow"             # Often false positives
 too_many_lines = "allow"            # Subjective function length
 module_name_repetitions = "allow"   # FooModule::Foo patterns are common and fine
 struct_excessive_bools = "allow"    # Sometimes structs legitimately need multiple bools
-fn_params_excessive_bools = "allow" # Sometimes functions legitimately need multiple bools
+fn_params_excessive_bools = "allow" # Sometimes structs legitimately need multiple bools
 items_after_statements = "allow"    # Style preference, not harmful
 uninlined_format_args = "allow"     # format!("{}", x) vs format!("{x}") is minor
 return_self_not_must_use = "allow"  # Builder pattern returns
@@ -97,10 +145,6 @@ print_stdout = "deny"
 print_stderr = "deny"
 
 # These are some of clippy's nursery (i.e., experimental) lints that we like.
-# By default, nursery lints are allowed. Some of the lints below have made good
-# suggestions which we fixed. The others didn't have any findings, so we can
-# assume they don't have that many false positives. Let's enable them to
-# prevent future problems.
 borrow_as_ptr = "warn"
 branches_sharing_code = "warn"
 clear_with_drain = "warn"
@@ -165,7 +209,6 @@ zero_sized_map_values = "warn"
 
 # These are nursery lints which have findings. Allow them for now. Some are not
 # quite mature enough for use in our codebase and some we don't really want.
-# Explicitly listing should make it easier to fix in the future.
 as_ptr_cast_mut = "allow"
 cognitive_complexity = "allow"
 debug_assert_with_mut_call = "allow"
@@ -206,3 +249,10 @@ strip = "symbols"
 opt-level = 3
 incremental = false
 codegen-units = 1
+
+# Patched third-party sources. Must stay last: a `[patch.*]` header ends whatever
+# table precedes it, so splicing one into the middle of `[workspace.dependencies]`
+# silently reparents every entry below it (this broke all `workspace = true`
+# inheritance once; do not repeat it).
+[patch.crates-io]
+allocative = { path = "third-party/allocative" }

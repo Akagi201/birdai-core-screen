@@ -1,0 +1,28 @@
+[package]
+name = "birdai"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+birdai-amm.workspace = true
+birdai-move.workspace = true
+birdai-resolve.workspace = true
+birdai-state.workspace = true
+birdai-tick.workspace = true
+birdai-venue.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+eyre.workspace = true
+http.workspace = true
+move-core-types.workspace = true
+prometheus.workspace = true
+sui-indexer-alt-framework.workspace = true
+sui-types.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
