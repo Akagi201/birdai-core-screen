@@ -146,6 +146,24 @@ impl AnyVenue {
             _ => None,
         }
     }
+
+    /// The Volo pool, if this is one.
+    #[must_use]
+    pub fn as_volo(&self) -> Option<&VoloNativePool> {
+        match self {
+            Self::Volo(pool) => Some(pool),
+            _ => None,
+        }
+    }
+
+    /// The Navi storage, if this is one.
+    #[must_use]
+    pub fn as_navi(&self) -> Option<&NaviStorage> {
+        match self {
+            Self::Navi(storage) => Some(storage),
+            _ => None,
+        }
+    }
 }
 
 /// Decode `bytes` according to `tag`, if `tag` is a venue type **and the layout has that shape**.

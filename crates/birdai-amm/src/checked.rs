@@ -122,9 +122,12 @@ impl CheckedU256 {
         self.0.checked_shl(bits).map(Self).ok_or(AmmError::Overflow { op: "shl" })
     }
 
-    /// Checked right shift.
+    /// Checked right shift; shifts at or beyond the width saturate to zero.
     #[inline]
     pub fn checked_shr(self, bits: u32) -> Result<Self, AmmError> {
+        if bits >= 256 {
+            return Ok(Self::zero());
+        }
         self.0.checked_shr(bits).map(Self).ok_or(AmmError::Overflow { op: "shr" })
     }
 }
@@ -178,6 +181,14 @@ mod tests {
         assert!(matches!(too_big.to_u128(), Err(AmmError::Overflow { .. })));
         let fits = CheckedU256::from_u128(u128::MAX);
         assert_eq!(fits.to_u128()?, u128::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_shifts_saturate_to_zero() -> Result<(), AmmError> {
+        // ponytail: `shr` past the width is zero, not an overflow.
+        assert_eq!(CheckedU256::from_u64(7).checked_shr(256)?.to_u128()?, 0);
+        assert_eq!(CheckedU256::from_u64(7).checked_shr(300)?.to_u128()?, 0);
         Ok(())
     }
 }

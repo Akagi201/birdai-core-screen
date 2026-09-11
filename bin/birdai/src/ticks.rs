@@ -16,6 +16,12 @@ use sui_types::object::Object;
 /// How many child objects to fetch per batch.
 const FETCH_BATCH: usize = 200;
 
+/// Upper bound on dynamic-field pages followed for one pool.
+const MAX_PAGES: usize = 4096;
+
+/// Upper bound on the initial reservation from the on-chain `size` hint.
+const MAX_INITIAL_RESERVE: usize = 8192;
+
 /// Every node of a pool's tick skip list.
 ///
 /// The caller feeds the result to [`birdai_tick::Ticks::new`], which sorts them, asserts the skip
@@ -32,9 +38,12 @@ where
     O: ObjectSource + ?Sized,
     L: LayoutSource + ?Sized,
 {
-    let mut field_ids = Vec::with_capacity(usize::try_from(head.size).unwrap_or(0));
+    // ponytail: `head.size` is on-chain input — cap the reservation and the page walk.
+    let reserve = usize::try_from(head.size).unwrap_or(0).min(MAX_INITIAL_RESERVE);
+    let mut field_ids = Vec::new();
+    field_ids.try_reserve(reserve).ok();
     let mut cursor = None;
-    loop {
+    for _ in 0..MAX_PAGES {
         let page = source.dynamic_fields(head.node_uid, cursor.clone()).await?;
         if page.entries.is_empty() {
             break;

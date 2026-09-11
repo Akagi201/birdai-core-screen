@@ -127,15 +127,17 @@ pub(crate) async fn decode(session: &Session) -> eyre::Result<()> {
 /// Load pool A and type it.
 pub(crate) async fn load_pool(session: &Session, version: Option<u64>) -> eyre::Result<CetusClmm> {
     let decoded = session.decode(object_id(POOL_A)?, version).await?;
-    Ok(CetusClmm::decode(
-        decoded
-            .object
-            .data
-            .try_as_move()
-            .ok_or_else(|| eyre::eyre!("pool A is not a Move object"))?
-            .contents(),
-        &decoded.layout,
-    )?)
+    let move_object = decoded
+        .object
+        .data
+        .try_as_move()
+        .ok_or_else(|| eyre::eyre!("pool A is not a Move object"))?;
+    let tag = decoded.object.struct_tag().ok_or_else(|| eyre::eyre!("pool A has no type tag"))?;
+    // ponytail: reuse the shape gate so same-named foreign pools fail as unrecognised.
+    match birdai_venue::decode_venue(move_object.contents(), &tag, &decoded.layout)? {
+        AnyVenue::Cetus(pool) => Ok(*pool),
+        other => eyre::bail!("pool A decoded as {}", other.kind().label()),
+    }
 }
 
 /// Load and validate pool A's tick index.
@@ -230,7 +232,7 @@ pub(crate) async fn classify(session: &Session) -> eyre::Result<()> {
         );
     }
 
-    let decoded = session.decode(object_id(POOL_A)?, None).await?;
+    let decoded = session.decode(object_id(POOL_A)?, Some(POOL_A_POST_VERSION)).await?;
     let verdict = classifier
         .classify_object(
             session.layouts.as_ref(),
@@ -569,6 +571,12 @@ pub(crate) async fn follow(
         if applied >= count {
             break;
         }
+    }
+    if applied < count {
+        // ponytail: a closed stream before `count` venue checkpoints is not success.
+        tracing::warn!(
+            "stream ended after {seen} checkpoints with only {applied} venue checkpoints (wanted {count})"
+        );
     }
 
     rule("final state");

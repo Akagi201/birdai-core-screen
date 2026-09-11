@@ -521,6 +521,9 @@ fn record_into(
 
 fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T, FixtureError> {
     if !path.exists() {
+        // ponytail: missing fixture files default to empty but warn loudly; a mistyped
+        // `--fixtures` path must not surface as a far-away `ObjectNotFound`.
+        tracing::warn!("fixture file {} is missing; using an empty set", path.display());
         return Ok(T::default());
     }
     let text = std::fs::read_to_string(path).map_err(|error| io(path, error))?;
@@ -535,7 +538,10 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), FixtureError> 
         path: path.display().to_string(),
         message: error.to_string(),
     })?;
-    std::fs::write(path, text).map_err(|error| io(path, error))
+    // ponytail: atomic write so a crash cannot leave a truncated JSON that loads as empty.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|error| io(path, error))?;
+    std::fs::rename(&tmp, path).map_err(|error| io(path, error))
 }
 
 /// An [`ObjectSource`] that serves a fixture set and never touches the network.
@@ -574,22 +580,22 @@ impl ObjectSource for FixtureObjectSource {
     ) -> Result<crate::object::DynamicFieldPage, ResolveError> {
         // The capture stores the dynamic field *objects*, not the chain's index, so replay
         // reconstructs the parent's children by filtering on the recorded owner — which is exactly
-        // what the index would have returned.
-        Ok(crate::object::DynamicFieldPage {
-            entries: self
-                .fixtures
-                .objects
-                .values()
-                .flat_map(|versions| versions.values())
-                .filter_map(|encoded| decode(encoded).ok())
-                .filter_map(|object| {
-                    let owner = crate::object::dynamic_field_parent(&object)?;
-                    (owner == parent)
-                        .then_some(crate::object::DynamicFieldRef { parent, field_id: object.id() })
-                })
-                .collect(),
-            next: None,
-        })
+        // what the index would have returned. Single-page: fixtures are a closed set.
+        let mut entries = Vec::new();
+        for encoded in self.fixtures.objects.values().flat_map(|versions| versions.values()) {
+            let object = match decode(encoded) {
+                Ok(object) => object,
+                Err(error) => {
+                    tracing::warn!(%error, "fixture entry failed to decode; skipping");
+                    continue;
+                }
+            };
+            let Some(owner) = crate::object::dynamic_field_parent(&object) else { continue };
+            if owner == parent {
+                entries.push(crate::object::DynamicFieldRef { parent, field_id: object.id() });
+            }
+        }
+        Ok(crate::object::DynamicFieldPage { entries, next: None })
     }
 
     async fn chain_id(&self) -> Result<String, ResolveError> {
@@ -847,8 +853,9 @@ mod committed {
     fn load() -> Result<Option<Fixtures>, super::FixtureError> {
         let dir = fixtures_dir();
         if !dir.join("manifest.json").exists() {
+            // ponytail: visible skip so a fixture-less `cargo test` cannot look like coverage.
             tracing::warn!(
-                "no fixture directory at {}; run `cargo run -- fetch` to create it",
+                "SKIPPED fixture tests: no fixture directory at {}; run `cargo run -- fetch` to create it",
                 dir.display()
             );
             return Ok(None);

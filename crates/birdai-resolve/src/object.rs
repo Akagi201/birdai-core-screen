@@ -251,6 +251,8 @@ impl ObjectSource for GrpcObjectSource {
         let mut entries = Vec::with_capacity(response.dynamic_fields.len());
         for field in &response.dynamic_fields {
             let Some(text) = field.field_id.as_deref() else {
+                // ponytail: count, don't hide, an entry without an id.
+                tracing::warn!("dynamic field entry without a field id; skipping");
                 continue;
             };
             let field_id = text.parse::<ObjectID>().map_err(|_| ResolveError::Unparsable {
@@ -291,7 +293,12 @@ impl ObjectSource for GrpcObjectSource {
         // 650-odd tick nodes and then fetching them takes long enough that a tick can be removed in
         // between. So a batch failure is retried object by object, skipping anything that is gone.
         match self.client.batch_get_objects(ids).await {
-            Ok(objects) if objects.len() == ids.len() => Ok(objects),
+            Ok(objects)
+                if objects.len() == ids.len() &&
+                    objects.iter().zip(ids.iter()).all(|(object, id)| object.id() == *id) =>
+            {
+                Ok(objects)
+            }
             Ok(objects) => {
                 // A partial `Ok` is the same hazard in a quieter form: the caller asked for
                 // specific ids, so silently returning fewer would misattribute every object

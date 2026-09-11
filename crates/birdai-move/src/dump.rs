@@ -402,6 +402,11 @@ impl<'b, 'l> Visitor<'b, 'l> for Dump {
             if rendered < cap {
                 items.push(DumpItem { index: items.len(), span: inner.last_span, value });
                 rendered += 1;
+                if rendered == cap {
+                    // ponytail: stop decoding here; the rest is skipped at zero cost.
+                    while driver.skip_element()? {}
+                    break;
+                }
             }
         }
 

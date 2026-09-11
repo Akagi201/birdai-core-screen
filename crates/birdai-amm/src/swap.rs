@@ -191,7 +191,7 @@ pub struct Step {
 pub struct SwapResult {
     /// Gross input, including the fee.
     pub amount_in: u128,
-    /// Fee taken from the input.
+    /// Fee charged on the consumed input (floored, proportional on truncation).
     pub fee: u128,
     /// Net output.
     pub amount_out: u128,
@@ -322,7 +322,13 @@ pub fn swap_exact_in(
             // move the price backwards, so it is ignored rather than trusted.
         }
         .filter(|boundary| is_ahead(direction, boundary.sqrt_price, sqrt_price));
-        let limit = boundary.map_or(price_limit, |boundary| boundary.sqrt_price);
+        // ponytail: clamp the boundary to the swap's price limit so a stale/far boundary
+        // can never walk the price past what the transaction allowed.
+        let raw_limit = boundary.map_or(price_limit, |boundary| boundary.sqrt_price);
+        let limit = match direction {
+            Direction::BtoA => raw_limit.min(price_limit),
+            Direction::AtoB => raw_limit.max(price_limit),
+        };
 
         let (next, reached_limit) = next_price(direction, sqrt_price, liquidity, remaining, limit)?;
         if next == sqrt_price {
@@ -357,7 +363,8 @@ pub fn swap_exact_in(
         });
 
         sqrt_price = next;
-        remaining -= consumed;
+        remaining =
+            remaining.checked_sub(consumed).ok_or(AmmError::Overflow { op: "consume input" })?;
 
         if !reached_limit {
             break;
@@ -373,7 +380,15 @@ pub fn swap_exact_in(
             return Err(AmmError::TooManyCrossings { limit: max_crossings });
         }
 
-        liquidity = apply_liquidity_change(liquidity, boundary.liquidity_net)?;
+        // `Boundary::liquidity_net` is defined upwards; crossing downwards applies the negation.
+        let net = match direction {
+            Direction::BtoA => boundary.liquidity_net,
+            Direction::AtoB => boundary
+                .liquidity_net
+                .checked_neg()
+                .ok_or(AmmError::Overflow { op: "negate liquidity net" })?,
+        };
+        liquidity = apply_liquidity_change(liquidity, net)?;
         tick = boundary.tick;
 
         if remaining == 0 {
@@ -381,9 +396,20 @@ pub fn swap_exact_in(
         }
     }
 
+    // ponytail: fee is charged only on consumed input; truncated swaps refund the rest.
+    let fee_charged = if remaining == 0 || net_input == 0 {
+        fee
+    } else {
+        let refundable = CheckedU256::from_u128(fee)
+            .checked_mul(CheckedU256::from_u128(remaining))?
+            .checked_div(CheckedU256::from_u128(net_input))?
+            .to_u128()?;
+        fee.checked_sub(refundable).ok_or(AmmError::Overflow { op: "fee refund" })?
+    };
+
     Ok(SwapResult {
         amount_in,
-        fee,
+        fee: fee_charged,
         amount_out,
         sqrt_price_start,
         sqrt_price_end: sqrt_price,
@@ -424,6 +450,8 @@ const fn ordered(a: u128, b: u128) -> (u128, u128) {
 
 /// The scale factor of the Q64.64 fixed-point price, re-exported for callers that work in price
 /// space rather than in square-root-price space.
+///
+/// ponytail: alias of [`crate::tick::Q64`]; prefer `Q64` in new code.
 pub const PRICE_SCALE: u128 = Q64;
 
 #[cfg(test)]
@@ -878,6 +906,65 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_limit_inside_the_boundary_stops_at_the_limit() -> Result<(), AmmError> {
+        // ponytail: regression for limit-bypass; the boundary lies beyond the limit.
+        let mid = T_SQRT_PRICE + (T_NEXT_SQRT_PRICE - T_SQRT_PRICE) / 2;
+        let result = swap_exact_in(
+            &SingleBoundary,
+            Direction::BtoA,
+            PoolState { fee_rate: 0, ..T_STATE },
+            50_000_000_000_000,
+            mid,
+            8,
+        )?;
+        assert_eq!(result.sqrt_price_end, mid);
+        assert!(!result.input_consumed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_limit_inside_the_boundary_stops_at_the_limit_down() -> Result<(), AmmError> {
+        // ponytail: downward mirror of the clamp above.
+        let lower = LowerBoundary {
+            tick: 71_150,
+            sqrt_price: sqrt_price_at_tick(71_150)?,
+            liquidity_net: 1_000_000,
+        };
+        let mid = u128::midpoint(lower.sqrt_price, T_SQRT_PRICE);
+        assert!(mid < T_SQRT_PRICE && mid > lower.sqrt_price);
+        let result = swap_exact_in(
+            &lower,
+            Direction::AtoB,
+            PoolState { fee_rate: 0, ..T_STATE },
+            50_000_000_000_000,
+            mid,
+            8,
+        )?;
+        assert_eq!(result.sqrt_price_end, mid);
+        assert!(!result.input_consumed);
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_swaps_charge_fee_only_on_consumed_input() -> Result<(), AmmError> {
+        // ponytail: non-zero fee plus a limit that truncates must not charge the full fee.
+        let mid = T_SQRT_PRICE + (T_NEXT_SQRT_PRICE - T_SQRT_PRICE) / 2;
+        let full_fee = take_fee(50_000_000_000_000, T_FEE_RATE)?.1;
+        let result = swap_exact_in(
+            &SingleBoundary,
+            Direction::BtoA,
+            PoolState { fee_rate: T_FEE_RATE, ..T_STATE },
+            50_000_000_000_000,
+            mid,
+            8,
+        )?;
+        assert!(!result.input_consumed);
+        assert!(result.fee < full_fee, "truncated fee {} < full fee {full_fee}", result.fee);
+        assert!(result.fee > 0);
+        Ok(())
+    }
+
     /// `delta_a` rejects a zero price *before* it looks at liquidity, so an all-zero range is an
     /// error rather than a zero output. This pins the order of the two guards, which is otherwise
     /// unobservable: once the zero-price guard is in front, `liquidity == 0 || low == high` and
@@ -973,7 +1060,8 @@ mod tests {
         let lower = LowerBoundary {
             tick: 71_150,
             sqrt_price: sqrt_price_at_tick(71_150)?,
-            liquidity_net: -1_000_000,
+            // ponytail: lower-tick nets are positive upwards; crossing down removes it.
+            liquidity_net: 1_000_000,
         };
         assert!(lower.sqrt_price < T_SQRT_PRICE, "the boundary must lie below the price");
         let result = swap_exact_in(

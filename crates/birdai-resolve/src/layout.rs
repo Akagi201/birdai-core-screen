@@ -60,7 +60,13 @@ pub trait LayoutSource: Send + Sync {
     /// but versions only arrive through this hook. A poller that resolves layouts without ever
     /// feeding checkpoints must call it from its own package observations, or it will serve
     /// stale layouts after an upgrade.
-    fn note_packages(&self, _versions: Vec<(AccountAddress, u64)>) {}
+    ///
+    /// Takes a slice so both the trait dispatch (`&dyn LayoutSource`) and the inherent
+    /// `LayoutRegistry::note_packages` share one signature; a generic `impl IntoIterator`
+    /// inherent method would NOT override this hook when called through the trait.
+    fn note_packages(&self, versions: &[(AccountAddress, u64)]) {
+        let _ = versions;
+    }
 }
 
 /// A resolved layout plus everything needed to know when it stops being true.
@@ -129,9 +135,16 @@ impl<S> LayoutRegistry<S> {
     }
 
     /// The fingerprint recorded for a cached layout, if it is still live.
+    ///
+    /// Returns `None` when the tag is uncached **or** when a package it depends on has moved
+    /// since it was cached; `layout()` applies the same staleness check on read.
     #[must_use]
     pub fn fingerprint(&self, tag: &StructTag) -> Option<Fingerprint> {
-        self.cache.load().get(tag).map(|entry| entry.fingerprint)
+        let entry = self.cache.load().get(tag).cloned()?;
+        let live = self.packages.load();
+        let stale =
+            entry.dependencies.iter().any(|(address, version)| is_newer(&live, address, *version));
+        if stale { None } else { Some(entry.fingerprint) }
     }
 
     /// The versions currently believed to be live for each tracked package.
@@ -157,18 +170,23 @@ impl<S> LayoutRegistry<S> {
     /// construction**: a cached layout lists every package it references, so upgrading
     /// `skip_list` drops the Cetus pool's layout even though the pool's own package did not
     /// move.
-    pub fn note_packages(&self, versions: impl IntoIterator<Item = (AccountAddress, u64)>) {
-        let versions: Vec<(AccountAddress, u64)> = versions.into_iter().collect();
+    ///
+    /// ponytail: same signature as `LayoutSource::note_packages` so trait dispatch forwards here.
+    pub fn note_packages(&self, versions: &[(AccountAddress, u64)]) {
+        Self::record_packages(self, versions);
+    }
+
+    fn record_packages(&self, versions: &[(AccountAddress, u64)]) {
         if versions.is_empty() {
             return;
         }
 
         self.packages.rcu(|current| {
             let mut next = (**current).clone();
-            for (address, version) in &versions {
-                next.entry(*address)
-                    .and_modify(|seen| *seen = (*seen).max(*version))
-                    .or_insert(*version);
+            for &(address, version) in versions {
+                next.entry(address)
+                    .and_modify(|seen| *seen = (*seen).max(version))
+                    .or_insert(version);
             }
             Arc::new(next)
         });
@@ -218,6 +236,23 @@ fn is_newer<S: BuildHasher>(
     version: u64,
 ) -> bool {
     live.get(address).is_some_and(|current| *current > version)
+}
+
+/// Every package a `StructTag` mentions, including generic type parameters.
+fn collect_tag_addresses(tag: &StructTag, out: &mut BTreeSet<AccountAddress>) {
+    out.insert(tag.address);
+    for param in &tag.type_params {
+        collect_type_tag_addresses(param, out);
+    }
+}
+
+/// Every package a `TypeTag` mentions.
+fn collect_type_tag_addresses(tag: &TypeTag, out: &mut BTreeSet<AccountAddress>) {
+    match tag {
+        TypeTag::Struct(inner) => collect_tag_addresses(inner, out),
+        TypeTag::Vector(inner) => collect_type_tag_addresses(inner, out),
+        _ => {}
+    }
 }
 
 #[async_trait]
@@ -280,6 +315,11 @@ impl<S: PackageStore> LayoutSource for LayoutRegistry<S> {
             source,
         })
     }
+
+    fn note_packages(&self, versions: &[(AccountAddress, u64)]) {
+        // ponytail: forward trait dispatch to the shared eviction logic.
+        Self::record_packages(self, versions);
+    }
 }
 
 /// Every package a layout references, paired with the version believed to be live for it.
@@ -298,9 +338,9 @@ pub fn collect_dependencies<S: BuildHasher>(
     let mut addresses = BTreeSet::new();
     visit(layout, &mut |node| {
         if let MoveTypeLayout::Struct(inner) = node {
-            addresses.insert(inner.type_.address);
+            collect_tag_addresses(&inner.type_, &mut addresses);
         } else if let MoveTypeLayout::Enum(inner) = node {
-            addresses.insert(inner.type_.address);
+            collect_tag_addresses(&inner.type_, &mut addresses);
         }
     });
     addresses

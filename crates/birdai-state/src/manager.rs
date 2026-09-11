@@ -262,12 +262,16 @@ impl StateManager {
     /// [`StateManager::install_ticks`], this does not assert the skip list's declared size:
     /// children can only be listed as of the present, so an index loaded for any pool that has
     /// traded since will legitimately disagree with historical metadata.
-    pub fn set_ticks(&self, id: ObjectID, ticks: Arc<Ticks>) {
-        let _ = self.slots.update_sync(&id, |_key, slot| {
-            let previous = slot.ticks.clone();
-            *slot = Arc::new(VenueSlot { ticks: Some(ticks), ..(**slot).clone() });
-            previous
-        });
+    ///
+    /// Returns `true` when the slot existed and was updated; `false` when `id` is untracked.
+    pub fn set_ticks(&self, id: ObjectID, ticks: Arc<Ticks>) -> bool {
+        self.slots
+            .update_sync(&id, |_key, slot| {
+                let previous = slot.ticks.clone();
+                *slot = Arc::new(VenueSlot { ticks: Some(ticks), ..(**slot).clone() });
+                previous
+            })
+            .is_some()
     }
 
     fn venues_updated_now(&self) {
@@ -303,15 +307,17 @@ impl StateManager {
     ///    before it is used to type the objects in the same checkpoint;
     /// 2. distinct venue tags resolved once, not once per object;
     /// 3. decoding on the blocking pool with `rayon`, because the layouts are already in hand and
-    ///    an `async` worker must not sit on CPU-bound work;
+    ///    an `async` worker stays free for I/O;
     /// 4. slots published per object, with the commit counter bumped at the end.
     ///
-    /// Versions are monotone per object: an incoming version older than the slot's is an
-    /// [`StateError::OutOfOrder`] (applied twice, or out of order — either would silently serve
-    /// a stale price), while re-applying the version already held is a no-op so a retried
-    /// checkpoint stays idempotent. Checkpoints themselves are monotone too: a checkpoint at or
-    /// below the last applied sequence is a duplicate delivery and is skipped whole, which is
-    /// what makes re-applying a checkpoint that touched one object several times safe.
+    /// Must be called serially for one manager: concurrent `apply_checkpoint` calls can
+    /// interleave publication and move `last_applied` backwards. Versions are monotone per
+    /// object: an incoming version older than the slot's is counted and skipped (it would
+    /// silently serve a stale price), while re-applying the version already held is a no-op so
+    /// a retried checkpoint stays idempotent. Checkpoints themselves are monotone too: a
+    /// checkpoint at or below the last applied sequence is a duplicate delivery and is skipped
+    /// whole, which is what makes re-applying a checkpoint that touched one object several
+    /// times safe.
     pub async fn apply_checkpoint<L: LayoutSource + ?Sized>(
         &self,
         layouts: &L,
@@ -323,8 +329,9 @@ impl StateManager {
         // Duplicate delivery: an ordered stream only replays a checkpoint on retry, and
         // skipping is the safe direction — serving it again could only move a slot backwards
         // through an intermediate version the stream already superseded.
+        // ponytail: `checkpoints == 0` guards genesis so re-applying sequence 0 still skips.
         let last = self.last_applied.load(Ordering::Relaxed);
-        if last != 0 && sequence <= last {
+        if self.checkpoints.load(Ordering::Relaxed) != 0 && sequence <= last {
             tracing::debug!(
                 checkpoint = sequence,
                 last_applied = last,
@@ -337,7 +344,7 @@ impl StateManager {
         let observations = self.package_observations(checkpoint);
         report.packages_observed = observations.len();
         if !observations.is_empty() {
-            layouts.note_packages(observations);
+            layouts.note_packages(&observations);
             self.package_observations.fetch_add(report.packages_observed as u64, Ordering::Relaxed);
         }
 
@@ -407,12 +414,17 @@ impl StateManager {
                         %error,
                         "could not resolve a layout; skipping its objects for this checkpoint"
                     );
-                    self.failures.fetch_add(1, Ordering::Relaxed);
-                    report.failures += 1;
                 }
             }
         }
+        // ponytail: count skipped objects, not tags, so monitoring sees affected objects.
+        let before = candidates.len();
         candidates.retain(|(_, tag)| resolved.contains_key(tag));
+        let skipped = before - candidates.len();
+        if skipped > 0 {
+            self.failures.fetch_add(skipped as u64, Ordering::Relaxed);
+            report.failures += skipped;
+        }
 
         // (4) Decode on the blocking pool: no I/O is left, and every layout is in hand. The
         // BCS is copied out of the checkpoint first so the spawned work owns its inputs — a
@@ -425,7 +437,13 @@ impl StateManager {
                 .get(&tag)
                 .ok_or_else(|| StateError::MissingLayout(tag.to_canonical_string(true)))?;
             let Some(move_object) = object.data.try_as_move() else {
-                return Err(StateError::NotMoveObject(object.id().to_canonical_string(true)));
+                // ponytail: one bad object skips with a count; aborting would poison the
+                // checkpoint.
+                let id = object.id().to_canonical_string(true);
+                tracing::warn!(object = %id, "checkpoint object has no Move data; skipping");
+                self.failures.fetch_add(1, Ordering::Relaxed);
+                report.failures += 1;
+                continue;
             };
             untyped.push((
                 object.id(),
@@ -458,9 +476,23 @@ impl StateManager {
                     let existing = self.slots.read_sync(&id, |_key, slot| {
                         (slot.version, slot.ticks.clone(), slot.layout)
                     });
-                    // Monotone per object: older than the slot is an out-of-order apply,
-                    // equal is a retried checkpoint and stays a no-op.
-                    if !should_publish(&id, existing.as_ref().map(|(held, _, _)| *held), version)? {
+                    // Monotone per object: older than the slot is counted and skipped (publishing
+                    // it would silently serve a stale price and poison retries), equal is a
+                    // retried checkpoint and stays a no-op.
+                    let publish = match should_publish(
+                        &id,
+                        existing.as_ref().map(|(held, _, _)| *held),
+                        version,
+                    ) {
+                        Ok(publish) => publish,
+                        Err(error) => {
+                            tracing::warn!(%error, "out-of-order object version; skipping");
+                            self.failures.fetch_add(1, Ordering::Relaxed);
+                            report.failures += 1;
+                            continue;
+                        }
+                    };
+                    if !publish {
                         continue;
                     }
                     let kind = venue.kind();
@@ -515,44 +547,47 @@ impl StateManager {
         // Children are indexed only for the inner UIDs of tracked Cetus pools. Anything else —
         // a lending ledger's user table, a staking pool's vaults — is state we never price, and
         // indexing it would let one busy parent bloat the map without bound.
-        let mut priced: HashSet<ObjectID> = HashSet::new();
-        self.slots.iter_sync(|_key, slot| {
-            if let AnyVenue::Cetus(pool) = &slot.venue {
-                priced.insert(pool.ticks.node_uid);
-            }
-            true
-        });
-        let grouped = group_children(&child_parents);
-        for (parent, field_ids) in &grouped {
-            if !priced.contains(parent) {
-                continue;
-            }
-            let mut occupied = self
-                .children
-                .entry_sync(*parent)
-                .or_insert_with(|| ChildSet::new(self.child_capacity));
-            let set = occupied.get_mut();
-            let mut inserted = 0_usize;
-            let mut dropped = 0_usize;
-            for field_id in field_ids {
-                if set.insert(*field_id) {
-                    inserted += 1;
-                } else if !set.field_ids.contains(field_id) {
-                    dropped += 1;
+        // ponytail: skip the O(venues) scan when the checkpoint carried no children.
+        if !child_parents.is_empty() {
+            let mut priced: HashSet<ObjectID> = HashSet::new();
+            self.slots.iter_sync(|_key, slot| {
+                if let AnyVenue::Cetus(pool) = &slot.venue {
+                    priced.insert(pool.ticks.node_uid);
                 }
-            }
-            if inserted > 0 {
-                self.children_indexed.fetch_add(inserted as u64, Ordering::Relaxed);
-                report.children_indexed += inserted;
-            }
-            if dropped > 0 {
-                tracing::warn!(
-                    parent = %parent.to_canonical_string(true),
-                    dropped,
-                    "child set at capacity; dropped dynamic-field children"
-                );
-                self.children_dropped.fetch_add(dropped as u64, Ordering::Relaxed);
-                report.children_dropped += dropped;
+                true
+            });
+            let grouped = group_children(&child_parents);
+            for (parent, field_ids) in &grouped {
+                if !priced.contains(parent) {
+                    continue;
+                }
+                let mut occupied = self
+                    .children
+                    .entry_sync(*parent)
+                    .or_insert_with(|| ChildSet::new(self.child_capacity));
+                let set = occupied.get_mut();
+                let mut inserted = 0_usize;
+                let mut dropped = 0_usize;
+                for field_id in field_ids {
+                    if set.insert(*field_id) {
+                        inserted += 1;
+                    } else if !set.field_ids.contains(field_id) {
+                        dropped += 1;
+                    }
+                }
+                if inserted > 0 {
+                    self.children_indexed.fetch_add(inserted as u64, Ordering::Relaxed);
+                    report.children_indexed += inserted;
+                }
+                if dropped > 0 {
+                    tracing::warn!(
+                        parent = %parent.to_canonical_string(true),
+                        dropped,
+                        "child set at capacity; dropped dynamic-field children"
+                    );
+                    self.children_dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+                    report.children_dropped += dropped;
+                }
             }
         }
 
@@ -567,7 +602,8 @@ impl StateManager {
     /// `type_origin_table` still points at the original for inherited types, and the layout
     /// resolver canonicalises struct tags to exactly those original ids. Recording the observation
     /// under the *original* id is therefore what makes an upgrade invalidate the layouts that
-    /// mention it; recording it under the new id would invalidate a layout nobody has cached.
+    /// mention it. The new id is recorded too as belt-and-braces (it can only over-invalidate),
+    /// so `packages_observed` counts both.
     #[must_use]
     pub fn package_observations(&self, checkpoint: &Checkpoint) -> Vec<(AccountAddress, u64)> {
         let mut out = Vec::new();
@@ -600,7 +636,9 @@ impl StateManager {
             ticks.validate_spacing(pool.tick_spacing)?;
         }
         let ticks = Arc::new(ticks);
-        self.set_ticks(id, ticks.clone());
+        if !self.set_ticks(id, ticks.clone()) {
+            return Err(StateError::UnknownVenue(id.to_canonical_string(true)));
+        }
         Ok(ticks)
     }
 }
@@ -696,6 +734,32 @@ mod tests {
         let grouped = group_children(&[(parent, field), (other, field)]);
         assert_eq!(grouped[&parent], vec![field]);
         assert_eq!(grouped[&other], vec![field]);
+    }
+
+    #[test]
+    fn ticks_for_an_untracked_object_are_an_error_not_silent() {
+        use move_core_types::account_address::AccountAddress;
+        // ponytail: regression for silent no-op `set_ticks`.
+        let manager = StateManager::new();
+        let id = ObjectID::from(AccountAddress::new([9; 32]));
+        let ticks = std::sync::Arc::new(birdai_tick::Ticks::default());
+        assert!(!manager.set_ticks(id, ticks));
+        assert!(matches!(
+            manager.install_ticks(id, &head_for(id), Vec::<birdai_tick::TickNode>::new()),
+            Err(StateError::UnknownVenue(_))
+        ));
+    }
+
+    fn head_for(node_uid: ObjectID) -> birdai_tick::SkipListHead {
+        birdai_tick::SkipListHead {
+            node_uid,
+            head: None,
+            tail: None,
+            level: 0,
+            max_level: 0,
+            size: 0,
+            seed: 0,
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

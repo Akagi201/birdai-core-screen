@@ -43,6 +43,10 @@ pub enum StateError {
         incoming: u64,
     },
 
+    /// Ticks were supplied for an object the manager does not track.
+    #[error("object {0} is not tracked; ticks were not installed")]
+    UnknownVenue(String),
+
     /// A layout could not be resolved while typing an object.
     #[error(transparent)]
     Resolve(#[from] birdai_resolve::ResolveError),

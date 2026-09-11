@@ -332,7 +332,7 @@ impl Classifier {
             module_count += 1;
             function_count += sibling.functions(None, None).count();
             if swap_entry.is_none() {
-                swap_entry = find_inter_asset_swap(name, sibling).map_err(|message| {
+                swap_entry = find_inter_asset_swap(name, sibling, tag).map_err(|message| {
                     VenueError::Function {
                         module: name.clone(),
                         function: "<scan>".to_owned(),
@@ -408,7 +408,7 @@ impl Classifier {
         if !is_callable(&definition) {
             return Ok(None);
         }
-        Ok(swap_shape(resolved.name(), function, &definition, EntryEvidence::ObservedCall))
+        Ok(swap_shape(resolved.name(), function, &definition, EntryEvidence::ObservedCall, None))
     }
 
     /// Turn static evidence, plus an optional observed price move, into a verdict.
@@ -514,6 +514,7 @@ impl Classifier {
 pub fn find_inter_asset_swap(
     module_name: &str,
     module: &Module,
+    venue: &StructTag,
 ) -> Result<Option<SwapEntry>, String> {
     for name in module.functions(None, None) {
         let definition = module.function_def(name).map_err(|error| error.to_string())?;
@@ -523,7 +524,9 @@ pub fn find_inter_asset_swap(
         if !is_callable(&definition) {
             continue;
         }
-        if let Some(entry) = swap_shape(module_name, name, &definition, EntryEvidence::StaticScan) {
+        if let Some(entry) =
+            swap_shape(module_name, name, &definition, EntryEvidence::StaticScan, Some(venue))
+        {
             return Ok(Some(entry));
         }
     }
@@ -539,16 +542,21 @@ fn swap_shape(
     name: &str,
     definition: &FunctionDef,
     evidence: EntryEvidence,
+    venue: Option<&StructTag>,
 ) -> Option<SwapEntry> {
     // The venue's own state must be mutated, and it must be a *generic* object: the assets being
     // exchanged are its type parameters, so a function that mutably borrows something with none —
     // a registry, a factory, a capability, a lending ledger — cannot be trading the object's assets
     // for each other. This one clause rejects Volo's `stake`/`unstake` and every Navi entry,
     // because neither `NativePool` nor `Storage` has a type parameter.
-    let mutates_generic_state = definition
-        .parameters
-        .iter()
-        .any(|parameter| is_mutable_generic_reference(&parameter.body, parameter.ref_));
+    // ponytail: for static scans the borrow must name the venue itself, not any generic.
+    let mutates_generic_state = definition.parameters.iter().any(|parameter| {
+        if let Some(venue) = venue.filter(|_| evidence == EntryEvidence::StaticScan) {
+            is_mutable_venue_reference(&parameter.body, parameter.ref_, venue)
+        } else {
+            is_mutable_generic_reference(&parameter.body, parameter.ref_)
+        }
+    });
     if !mutates_generic_state {
         return None;
     }
@@ -610,6 +618,27 @@ fn is_mutable_generic_reference(body: &OpenSignatureBody, reference: Option<Refe
         }
         _ => false,
     }
+}
+
+/// True when this is a `&mut Venue<…, TypeParameter, …>` — a mutable borrow of the venue itself.
+fn is_mutable_venue_reference(
+    body: &OpenSignatureBody,
+    reference: Option<Reference>,
+    venue: &StructTag,
+) -> bool {
+    if !matches!(reference, Some(Reference::Mutable)) {
+        return false;
+    }
+    let OpenSignatureBody::Datatype(key, arguments) = body else {
+        return false;
+    };
+    if key.package != venue.address ||
+        key.module.as_ref() != venue.module.as_str() ||
+        key.name.as_ref() != venue.name.as_str()
+    {
+        return false;
+    }
+    arguments.iter().any(|argument| matches!(argument, OpenSignatureBody::TypeParameter(_)))
 }
 
 /// The type parameter inside `Coin<T>` or `Balance<T>`, in any position or reference mode.
@@ -772,13 +801,21 @@ fn record_if_oracle(tag: &StructTag, deny: &OracleDenySet, out: &mut Vec<OracleR
 }
 
 fn reference_from_text(text: &str, deny: &OracleDenySet) -> Option<OracleReference> {
+    // ponytail: underscore-boundary match so `HistoracleToken` does not trip `oracle`
+    // while `price_oracle` still does.
     let lowered = text.to_ascii_lowercase();
-    deny.fragments.iter().find(|fragment| lowered.contains(fragment.as_str())).map(|fragment| {
-        OracleReference {
-            package: "<in signature>".to_owned(),
-            module: fragment.clone(),
-            via: OracleVia::SwapSignature,
-        }
+    let hit_fragment = deny.fragments.iter().find(|fragment| {
+        lowered.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|token| {
+            token == fragment.as_str() ||
+                token.starts_with(&format!("{fragment}_")) ||
+                token.ends_with(&format!("_{fragment}")) ||
+                (fragment.contains('_') && token.contains(fragment.as_str()))
+        })
+    });
+    hit_fragment.map(|fragment| OracleReference {
+        package: "<in signature>".to_owned(),
+        module: fragment.clone(),
+        via: OracleVia::SwapSignature,
     })
 }
 
@@ -869,7 +906,7 @@ mod tests {
         language_storage::StructTag,
     };
 
-    use super::{OracleDenySet, PriceStateChange, referenced_types};
+    use super::{OracleDenySet, PriceStateChange, reference_from_text, referenced_types};
     use crate::venue::PriceState;
 
     fn ident(text: &str) -> Identifier {
@@ -948,5 +985,14 @@ mod tests {
         assert!(
             !change(-10, 10, 100, 101, vec!["0x1::oracle::PriceOracle".to_owned()]).is_endogenous()
         );
+    }
+
+    #[test]
+    fn signature_oracle_match_uses_underscore_boundaries() {
+        let deny = OracleDenySet::default_mainnet();
+        // ponytail: `HistoracleToken` must not trip `oracle`.
+        assert!(reference_from_text("&mut HistoracleToken<T0>", &deny).is_none());
+        assert!(reference_from_text("0x2::price_oracle::PriceOracle", &deny).is_some());
+        assert!(reference_from_text("0x2::coin::Coin<T0>", &deny).is_none());
     }
 }

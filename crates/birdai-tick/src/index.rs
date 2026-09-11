@@ -16,6 +16,9 @@ use crate::error::TickError;
 pub const CETUS_TICK_BIAS: i32 = 443_636;
 
 /// The skip-list key for a tick index: `tick + MAX_TICK`.
+///
+/// Valid only for `tick + BIAS >= 0`; use [`checked_score_from_tick`] on untrusted input.
+/// ponytail: unchecked for hot-path speed; debug builds assert the domain.
 #[must_use]
 #[inline]
 pub const fn score_from_tick(tick: i32) -> u64 {
@@ -25,6 +28,8 @@ pub const fn score_from_tick(tick: i32) -> u64 {
 }
 
 /// The tick index behind a skip-list key.
+///
+/// Valid only for `score <= i32::MAX`; use [`checked_tick_from_score`] on untrusted input.
 #[must_use]
 #[inline]
 pub const fn tick_from_score(score: u64) -> i32 {
@@ -148,10 +153,15 @@ impl SizeSkew {
     /// written.
     #[must_use]
     pub const fn delta(self) -> i64 {
-        // Both counts are small in practice; the saturating path only exists so a corrupt
-        // metadata count cannot wrap the sign.
-        self.observed.saturating_sub(self.declared) as i64 -
-            self.declared.saturating_sub(self.observed) as i64
+        // ponytail: saturate via i128 so a corrupt u64 count cannot wrap the `as i64` cast.
+        let diff = self.observed as i128 - self.declared as i128;
+        if diff > i64::MAX as i128 {
+            i64::MAX
+        } else if diff < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            diff as i64
+        }
     }
 }
 

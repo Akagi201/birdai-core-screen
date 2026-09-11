@@ -37,6 +37,15 @@ fn size_skew_delta_is_signed_and_directional() {
 }
 
 #[test]
+fn size_skew_delta_saturates_on_corrupt_counts() {
+    // ponytail: a corrupt `u64::MAX` count must not wrap the `as i64` cast.
+    let corrupt = SizeSkew { declared: u64::MAX, observed: 0 };
+    assert!(corrupt.delta() < 0, "corrupt delta must stay negative: {}", corrupt.delta());
+    let huge = SizeSkew { declared: 0, observed: u64::MAX };
+    assert_eq!(huge.delta(), i64::MAX);
+}
+
+#[test]
 fn from_children_reports_a_skew_only_when_the_counts_differ() -> Result<(), crate::TickError> {
     let ticks = [node(71_180, 647_882_882_935_015_212_980, 1)];
 

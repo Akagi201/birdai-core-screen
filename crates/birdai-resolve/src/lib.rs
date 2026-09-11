@@ -181,16 +181,55 @@ mod tests {
             )));
 
         // Seed the package tracker by hand through the public API used by the checkpoint path.
-        registry.note_packages([(AccountAddress::TWO, 1)]);
+        registry.note_packages(&[(AccountAddress::TWO, 1)]);
         assert_eq!(registry.package_versions().get(&AccountAddress::TWO), Some(&1));
 
         // A second, older observation must not move a version backwards.
-        registry.note_packages([(AccountAddress::TWO, 1)]);
+        registry.note_packages(&[(AccountAddress::TWO, 1)]);
         assert_eq!(registry.package_versions().get(&AccountAddress::TWO), Some(&1));
 
         // And a newer one must move it forwards.
-        registry.note_packages([(AccountAddress::TWO, 7)]);
+        registry.note_packages(&[(AccountAddress::TWO, 7)]);
         assert_eq!(registry.package_versions().get(&AccountAddress::TWO), Some(&7));
+    }
+
+    #[test]
+    fn note_packages_through_the_trait_dispatch_invalidates() {
+        // ponytail: regression for the trait-dispatch trap; `apply_checkpoint` calls
+        // through `&dyn LayoutSource`, so the trait method must forward to eviction.
+        use super::layout::LayoutSource;
+        let registry: LayoutRegistry<sui_package_resolver::PackageStoreWithLruCache<NoStore>> =
+            LayoutRegistry::new(Arc::new(sui_package_resolver::Resolver::new(
+                sui_package_resolver::PackageStoreWithLruCache::new(NoStore),
+            )));
+        let source: &dyn LayoutSource = &registry;
+        source.note_packages(&[(AccountAddress::TWO, 3)]);
+        assert_eq!(registry.package_versions().get(&AccountAddress::TWO), Some(&3));
+    }
+
+    #[test]
+    fn dependencies_include_generic_type_parameters() {
+        // ponytail: a phantom `Pool<A>` depends on A's package even when A leaves no field.
+        let inner = StructTag {
+            address: AccountAddress::ONE,
+            module: ident("usdc"),
+            name: ident("USDC"),
+            type_params: vec![],
+        };
+        let layout = struct_layout("pool", "Pool", vec![]);
+        let mut with_param = match layout {
+            MoveTypeLayout::Struct(inner_layout) => inner_layout,
+            _ => unreachable!(),
+        };
+        with_param.type_.type_params = vec![TypeTag::Struct(Box::new(inner))];
+        let layout = MoveTypeLayout::Struct(with_param);
+        let addresses: Vec<AccountAddress> =
+            collect_dependencies(&layout, &std::collections::HashMap::new())
+                .iter()
+                .map(|(a, _)| *a)
+                .collect();
+        assert!(addresses.contains(&AccountAddress::ONE));
+        assert!(addresses.contains(&AccountAddress::TWO));
     }
 
     /// A `PackageStore` that always fails, so the registry's bookkeeping can be tested without a
