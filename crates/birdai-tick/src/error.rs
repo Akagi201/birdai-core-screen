@@ -34,6 +34,18 @@ pub enum TickError {
         neighbour: u64,
     },
 
+    /// A node's key does not encode its tick index.
+    ///
+    /// `score` must equal `tick_index + 443_636`; anything else means the walk mixed up two
+    /// ticks or the node was misread.
+    #[error("node with key {score} claims tick index {tick}")]
+    ScoreMismatch {
+        /// The tick index the node stores.
+        tick: i32,
+        /// The key the node was filed under.
+        score: u64,
+    },
+
     /// The same node was decoded twice, which means the page walk repeated itself.
     #[error("node {0} was decoded more than once")]
     DuplicateNode(u64),
@@ -41,6 +53,18 @@ pub enum TickError {
     /// The level-0 chain is not ordered by tick index.
     #[error("the skip list's level-0 chain is not ordered by tick index")]
     Unordered,
+
+    /// An initialised tick sits off the pool's spacing grid.
+    ///
+    /// Ticks initialise only on multiples of `tick_spacing`; anything else means the node was
+    /// misread or does not belong to this pool.
+    #[error("tick {tick} is not on the spacing grid of {spacing}")]
+    OffGrid {
+        /// The offending tick index.
+        tick: i32,
+        /// The pool's tick spacing.
+        spacing: u32,
+    },
 
     /// A tick node's stored square-root price is further from the tick math than rounding allows.
     ///

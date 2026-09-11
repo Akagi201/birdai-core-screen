@@ -15,8 +15,9 @@ cargo run -- --fixtures fixtures reproduce
 ```
 
 Rust only. The Sui crates are taken from `github.com/MystenLabs/sui` pinned to one revision
-(`c8755d9c05209a22d91c07df76458992defd99c4`, the tip of `main`), toolchain 1.96.1. The first build
+(`b0535f1f3a3310e71790e90d8ae4e8ca840c897e`), toolchain 1.96.1. The first build
 clones that monorepo and takes a while; `docs/design.md` explains what is reused and why.
+`just deps-check` verifies the pin: every git dependency names a `rev`, and all revs are identical.
 
 By default the run talks to **two** mainnet endpoints, because no single public one does both jobs:
 `fullnode.mainnet.sui.io` for objects and the dynamic-field index, `archive.mainnet.sui.io` for
@@ -26,24 +27,29 @@ opts out of the split. Hosted providers that require authentication take `--api-
 
 ## Offline replay
 
-`fixtures/` holds 912 KB captured from mainnet: 653 objects (pool A at three versions, B, C, and 650
-tick nodes), 8 packages of bytecode, 4 resolved layouts, and a filtered checkpoint. Recapture with
-`cargo run -- fetch --out fixtures`.
+`fixtures/` holds 1.2 MB captured from mainnet: 658 object versions across 656 ids (pool A at
+three versions, B, C, and 653 tick nodes), 12 packages of bytecode, 9 resolved layouts, and a
+filtered checkpoint. Recapture with `cargo run -- fetch --out fixtures`.
 
 The fixture set stores **raw Sui types**, not derived answers — `Object` BCS, `MoveTypeLayout` JSON,
 and the parts of `Checkpoint` (which Sui deliberately does not make `Serialize`, so it is rebuilt from
 summary, contents, transactions and object set). Nothing in it is a pre-computed result. That is the
 point: `reproduce --fixtures fixtures` walks the same decoders, the same layout resolution and the same
 classifier as an online run, so its asserting the same `81_168_759` is a real check rather than a
-replay of a stored number. `cargo test` exercises the committed set directly: six tests load it and
+replay of a stored number. `cargo test` exercises the committed set directly: the fixture tests
 assert that pool A at version 995 150 484 decodes, the checkpoint reassembles with transaction T and
 its `pool_script_v2::swap_b2a` call intact, tick children are reachable through their inner UID,
-layouts round-trip out of JSON, and package bytecode still carries its modules.
+layouts round-trip out of JSON, and package bytecode still carries its modules — and the state
+tests replay checkpoint 320 577 815 through `StateManager` offline, asserting pool A is tracked at
+its output version and that re-applying the checkpoint is a no-op.
 
 Two honesty notes are written into the manifest: the captured checkpoint keeps only the 7 of 33
 transactions whose effects touch pool A, so its `object_set` is a subset; and tick-node counts can
 drift between a pool's declared `size` and what enumeration returns, because dynamic fields can only
-be listed as of the present.
+be listed as of the present. A third is worth stating plainly: the pool trades continuously, so any
+count in this file — 653 tick nodes, tick 72172, the histogram below — is already history by the
+time you read it. What does not drift is version-pinned: pool A at 995 150 484, transaction T, and
+the `81_168_759` they imply.
 
 ---
 
@@ -52,7 +58,9 @@ be listed as of the present.
 `cargo run -- decode` prints every field of every object with the **exact BCS byte range** each value
 came from, taken from `move_core_types::annotated_visitor`'s `ValueDriver::{start, position}`. The
 decoder implements that visitor directly, so there is no intermediate `MoveValue` tree and a field
-that is appended or reordered in an upgrade is skipped rather than breaking the decode.
+that is appended or reordered in an upgrade is skipped rather than breaking the decode. Byte
+ranges are layout-stable; the reserve and tick values below move as the pool trades, so treat the
+numbers as the shape of the output rather than as constants.
 
 ```
 0x1eabed72…::pool::Pool<…::usdc::USDC, 0x2::sui::SUI>
@@ -72,15 +80,16 @@ that is appended or reordered in an upgrade is skipped rather than breaking the 
             …7f07284d6d6373a1b32d8f721991c3c17aa2f895abcc34e0d5990a8a99aaf2ae  <address>
 ```
 
-The tick child is fetched through that inner UID, and its own output shows the skip list's key scheme:
+The tick child is fetched through that inner UID, and its own output shows the skip list's key scheme
+(values below are from the captured run; the pool keeps trading, so live ticks sit higher today):
 
 ```
-nearest initialised tick above 71990:
-  score            515636
-  tick index       72000   (score - 443636 = 72000)
-  sqrt_price       674996762080183266976
-  liquidity_net    -212759778363
-  nexts            [515646]
+nearest initialised tick above 72172:
+  score            515836
+  tick index       72200   (score - 443636 = 72200)
+  sqrt_price       681780251452874908957
+  liquidity_net    -2737953659066
+  nexts            [515976, 515986, 516006]
 ```
 
 ### Where the four standard cases bite
@@ -128,7 +137,8 @@ signature of the function that really ran as the strongest available evidence.
 ### Object A — `0x1eabed72…::pool::Pool<USDC, SUI>` (Cetus CLMM): **yes**
 
 The pool's own state carries `liquidity`, `current_sqrt_price` (Q64.64) and `current_tick_index`,
-plus a skip list of 654 initialised ticks with their `liquidity_net`. The marginal price is a pure
+plus a skip list of initialised ticks with their `liquidity_net` (653 in the captured set; the
+count drifts as the pool trades). The marginal price is a pure
 function of those fields. Clause (1) is satisfied by the executed entry `pool_script_v2::swap_b2a`,
 whose signature is `(&GlobalConfig, &mut Pool<T0, T1>, Coin<T0>, Coin<T1>, bool, u64, u64, u128,
 &Clock, &mut TxContext)` — a mutable borrow of the pool's generic state with coin legs on both of its
@@ -142,7 +152,7 @@ link no oracle. Every unit of price in this object is discovered by trading agai
 It is pool-shaped — `pending: Balance<SUI>`, `collectable_fee: Balance<SUI>`, a `vaults` table, a
 `validators` map — and it does hold SUI. But clause (1) fails **structurally and unconditionally**:
 `NativePool` has no type parameters, so no function on it can borrow generic state and exchange two
-of its own assets. Its 40 functions were scanned; the coin-touching ones are `stake` (SUI in, no
+of its own assets. Its 77 functions were scanned; the coin-touching ones are `stake` (SUI in, no
 coin out), `unstake` (CETUS in, nothing out), and `mint_ticket`/`burn_ticket` for the certificate —
 each moves *one* asset against a share claim. The SUI↔VSUI rate is an accounting ratio,
 `total_staked / total_shares`, that moves when rewards accrue or validators are rebalanced, never
@@ -157,8 +167,8 @@ reserves and ~999k user positions live in dynamic fields. Clause (1) fails for t
 reason as B — `Storage` has no type parameters, so `deposit`/`withdraw`/`borrow`/`repay`/`liquidate`
 each move one asset against a share claim and none of them can exchange two of the object's own
 assets. Clause (2) fails: nothing in those 208 bytes is a price. Clause (3) **fails as well**: the
-package statically links `oracle::PriceOracle`, reached from `lending`, `logic`, `calculator` and
-`dynamic_calculator`. Asset values are imported and interest is a utilisation curve; `Storage` is a
+package statically links `oracle::PriceOracle`, reached from `calculator`, `dynamic_calculator`,
+`lending` and `logic`. Asset values are imported and interest is a utilisation curve; `Storage` is a
 ledger, and a ledger with a price feed attached is still not a place where price is discovered.
 
 ---
@@ -186,9 +196,11 @@ result
   steps                1               liquidity unchanged: 120_115_891_674_982
 ```
 
-**Liquidity, price and range in force.** The active tick range is `[71_060, 71_180)`, with
-`L = 120_115_891_674_982`; the next initialised tick above is `71_180` at
-`sqrt_price = 647_882_882_935_015_212_980`. The step reaches `647_324_162_169_833_037_484`, which is
+**Liquidity, price and range in force.** At the version T consumed, the active tick range is
+`[71_060, 71_180)`, with `L = 120_115_891_674_982`; the next initialised tick above is `71_180` at
+`sqrt_price = 647_882_882_935_015_212_980`. (That bracketing is version-pinned history: the pool
+has traded since, so a live run brackets the *current* tick against *today's* children instead.)
+The step reaches `647_324_162_169_833_037_484`, which is
 below that, so **no tick is crossed and `L` is constant** — one step, exactly as the transaction
 description says. The move is 0.474 ticks, against a `tick_spacing` of 10.
 
@@ -220,13 +232,12 @@ Two implementation notes that decide correctness:
   numerator `(L ≪ 64)·ΔS < 2^256`, while `S·S' < 2^256` too. Arithmetic goes through a `CheckedU256`
   wrapper because `move_core_types::u256::U256`'s `Add`/`Sub`/`Mul` **wrap** and its `Div` panics on
   a zero divisor — wrapping in a pricing path is a silent wrong answer.
-* **Tick prices are read, never recomputed.** Validating all 654 nodes of pool A against
-  `⌊1.0001^(t/2)·2^64⌋` shows 652 exact and a worst case 7 units low at `√P ≈ 7.9·10^28`, a relative
-  error under `2^-90`. Exhaustive search over the plausible shapes of the on-chain routine found no
+* **Tick prices are read, never recomputed.** Validating the captured set's 653 nodes against
+  `⌊1.0001^(t/2)·2^64⌋` shows 651 exact and a worst case 7 units low at `√P ≈ 7.9·10^28`, a relative
+  error under `2^-90` (deviation histogram `{-7: 1, -1: 1, 0: 651}`). Exhaustive search over the
+  plausible shapes of the on-chain routine found no
   variant that reproduces every observed tick, so the stored values are authoritative and the
   function is used only for the inverse mapping and for validating that a node is what it claims.
-  One mainnet tick in this pool is *itself* the current tick: `71_990`, whose node stores
-  `674_659_364_925_037_324_824`.
 
 ---
 
@@ -255,7 +266,7 @@ manager needs two-phase commit and rollback; layouts come synchronously from `Mo
 upgrades are visible immediately; BCS is already trusted and can be borrowed without copying. Only
 the source and the commit protocol change — no venue, tick or math code does.
 
-*(Word count of the note proper: 280, limit 300.)*
+*(Word count of the note proper: ≈275, limit 300.)*
 
 ---
 
@@ -269,13 +280,14 @@ obvious beforehand. They are listed because the reasoning matters more than the 
    only looked at the defining package would report a false negative on the clearest venue in the
    set — which is why the probe also resolves the entry the chain actually executed.
 2. **`module::name` is not identity.** `follow` immediately hit 27 objects named `pool::Pool` from
-   other packages whose layouts differ, producing `MissingField` on every field. Name is now a hint
-   and the resolved layout's field set is the test; name collisions are counted as `skipped`, not
-   `failed`.
+   other packages whose layouts differ, failing the shape check on every one. Name is now a hint
+   and the resolved layout's field set is the test; name collisions are counted as `unrecognised`,
+   not `failed`.
 3. **A pool's children cannot be read at a historical version.** Transaction T consumed pool A at
-   version 995 150 484, which declares 650 ticks; enumerating the nodes today returns 653, because
-   dynamic fields can only be listed as of the present. The skew is reported, not swallowed.
-4. **On-chain tick prices are not exactly `⌊1.0001^(t/2)·2^64⌋`.** Two of pool A's 654 nodes differ,
+   version 995 150 484, which declares 650 ticks; enumerating the nodes at capture time returned
+   653, because dynamic fields can only be listed as of the present (and the live count keeps
+   drifting as the pool trades). The skew is reported, not swallowed.
+4. **On-chain tick prices are not exactly `⌊1.0001^(t/2)·2^64⌋`.** Two of the captured 653 nodes differ,
    one by 7 units. No plausible variant of the decomposition reproduces every observed value, so the
    stored per-tick prices are treated as authoritative — which the swap math already did.
 5. **The `hd` suffix of the fixed-point format is derivable, not memorable.** `S / 1.0001^(tick/2)`
@@ -286,9 +298,10 @@ obvious beforehand. They are listed because the reasoning matters more than the 
 7. **`move_core_types::u256::U256`'s operators wrap** and `Div` panics on zero. Nothing in its
    documentation index says so; its own source does, and a pricing path cannot use them.
 8. **`Client::batch_get_objects` collapses one missing object into a wholesale failure.** Enumerating
-   a pool's 650 tick nodes and then fetching them takes long enough that a tick can be removed in
+   a pool's ~650 tick nodes and then fetching them takes long enough that a tick can be removed in
    between — which is exactly what happened, taking the whole capture down. The source now retries
-   object by object and skips what is gone.
+   with bounded concurrency (32 at a time) and skips what is gone; a batch that answers short is
+   re-fetched the same way rather than trusted positionally.
 9. **Loading a fixture directory that does not exist must fail.** The first version silently returned
    an empty set, so a mistyped `--fixtures` path surfaced as "object not found" three commands later.
 10. **GetBlock's Sui endpoint does not serve gRPC v2.** `shared.eu-central-1.getblock.io/<key>` answered
@@ -302,34 +315,74 @@ obvious beforehand. They are listed because the reasoning matters more than the 
    is outside a fullnode's retention, so checkpoints are routed to the archival endpoint while dynamic
    fields stay on the fullnode (`--archive-url`, defaulting to `archive.mainnet.sui.io`, with `""`
    opting out). This also explains the transient `unavailable` errors seen before the split.
+12. **One bad object must not kill a checkpoint.** Replaying the captured checkpoint through the
+   state manager surfaced two cases the happy path never meets: the same pool mutated twice in one
+   checkpoint (so a naive re-apply walks versions backwards), and a second Cetus deployment whose
+   package the capture predates (so its layout does not resolve). Checkpoints are now deduplicated
+   by sequence with per-object version monotonicity behind them, and an unresolvable tag skips its
+   objects with a counted failure instead of aborting the apply.
+13. **A swap's price limit needs a side.** `swap_exact_in` accepted any `price_limit`, so a limit
+   behind the price walked the price backwards and a stale tick source could do the same through a
+   boundary. Both are now rejected or ignored up front (`UnreachablePriceLimit`), with a test on
+   each side — which is also what finally constructs that error variant.
+14. **Decoders fail closed on untrusted lengths.** A corrupt BCS length prefix could drive a huge
+   `Vec` pre-allocation, and a layout without Cetus's `OptionU64.v` decoded as `Some(0)`. The walk
+   still reads every element the driver yields, but the reservation is capped — and a missing
+   payload is `MissingField`, never a zero.
 
 ---
 
 ## Repository layout
 
 ```
-bin/birdai                 CLI: decode | classify | reproduce | calibrate | follow
+bin/birdai                 CLI: decode | classify | reproduce | calibrate | follow | fetch
 crates/birdai-move         protocol newtypes (I32, I128, OptionU64), the decoder toolkit, the dump
 crates/birdai-resolve      gRPC object source and a layout cache that invalidates on package upgrade
 crates/birdai-amm          tick math, delta math, exact-input swap, CheckedU256   (no I/O)
 crates/birdai-tick         the Cetus tick skip list: decode, index, validate, bracket
 crates/birdai-venue        typed venues and the price-discovery classifier
 crates/birdai-state        checkpoint-driven in-memory venue state
-docs/design.md             the full design, including the twelve defects found in its first revision
+docs/design.md             the full design, including the 29 defects found across two reviews
 ```
 
 `birdai-amm` and `birdai-tick` have no network dependency and are exercised entirely by unit and
-property tests. `just test` runs everything; `just lint` runs the pedantic Clippy set.
+property tests. `just test` runs everything; `just lint` runs the pedantic Clippy set; `just
+deps-check` verifies the Sui pin.
+
+## Verification
+
+```
+$ cargo test --all-features
+  birdai (bin)      5 passed   # incl. B/C decoding offline as vault and ledger
+  birdai-amm       46 passed   # incl. output_matches_the_chain_exactly (Δ = 0)
+  birdai-move       6 passed
+  birdai-resolve   15 passed
+  birdai-state      4 passed   # incl. offline replay of checkpoint 320577815
+  birdai-tick      34 passed
+  birdai-venue      6 passed
+  birdai-amm doctest 1 passed
+  ─────────────────────────
+  117 passed, 0 failed
+
+$ cargo run -- --fixtures fixtures reproduce   # 81_168_759 out, difference 0, ✔ exact match
+$ just lint        # typos, rumdl, cargo-sort, nightly fmt --check, nightly clippy -D warnings,
+                   # cargo-shear, workspace-inheritance-check — all green
+$ just deps-check  # all git dependencies pinned at b0535f1f...
+```
+
+Mutation testing: a scoped `cargo mutants` run over `birdai-tick/src/index.rs` (where the
+pricing invariants live) reports 103 caught, 33 unviable, **0 missed** — see `mutants.out/`.
+The guards added since that run (wrong-side price limits, stale boundaries, score/key
+consistency, version monotonicity, fail-closed `OptionU64`) each carry a killer test, verified by
+reverting the guard by hand and watching exactly its test fail.
 
 ## Status
 
 Everything in the brief is implemented and verified against mainnet: decode (including a tick child),
 classify, reproduce (`Δ = 0`), and the state manager described in the design note, which runs against
-the live checkpoint stream. 64 tests and a pedantic Clippy pass with `-D warnings`. Known limitations,
-all deliberate:
+the live checkpoint stream and loads a freshly seen pool's ticks on first sight. 117 tests and a
+pedantic Clippy pass with `-D warnings`. Known limitations, all deliberate:
 
-* `follow` loads a pool's tick set on demand rather than as part of the checkpoint walk, so a freshly
-  seen pool is tracked with its price state but without its ticks until asked.
 * The layout cache's upgrade invalidation is exercised by unit tests on the dependency graph, not yet
   by a live package upgrade observed in the stream (none occurred during testing).
 * The captured checkpoint is filtered to the transactions touching pool A, so a full replay of an

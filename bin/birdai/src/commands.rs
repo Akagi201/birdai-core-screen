@@ -8,7 +8,7 @@ use birdai_amm::{
 use birdai_resolve::fixture::Fixtures;
 use birdai_state::StateManager;
 use birdai_tick::{SizeSkew, Ticks};
-use birdai_venue::{CetusClmm, Classifier, Venue, price_state_change, venue_kind_of};
+use birdai_venue::{AnyVenue, CetusClmm, Classifier, Venue, price_state_change, venue_kind_of};
 use move_core_types::account_address::AccountAddress;
 use prometheus::Registry;
 use sui_indexer_alt_framework::ingestion::{
@@ -172,6 +172,7 @@ async fn load_tick_snapshot(
         load_tick_nodes(session.objects.as_ref(), session.layouts.as_ref(), &pool.ticks, |_| {})
             .await?;
     let (index, skew) = Ticks::from_children(Some(pool.ticks.node_uid), pool.ticks.size, nodes)?;
+    index.validate_spacing(pool.tick_spacing)?;
     Ok((Arc::new(index), skew))
 }
 
@@ -258,7 +259,7 @@ pub(crate) async fn classify(session: &Session) -> eyre::Result<()> {
     println!("     · the entry the chain executed, `pool_script_v2::swap_b2a`, mutably borrows");
     println!("       `Pool<T0, T1>` and carries coin legs on both of its type parameters;");
     println!("     · across T the pool's own `current_sqrt_price` rose while `coin_b` rose and");
-    println!("       `coin_a` fell, with no oracle among the 9 input objects;");
+    println!("       `coin_a` fell, with no oracle among the {} input objects;", inputs.len());
     println!("     · neither the pool's type nor its package links a price feed.");
     println!();
     println!(
@@ -375,7 +376,7 @@ pub(crate) async fn reproduce(session: &Session) -> eyre::Result<()> {
     let delta =
         birdai_amm::next_sqrt_price_up(pool.sqrt_price, pool.liquidity, net)? - pool.sqrt_price;
     let reached = pool.sqrt_price + delta;
-    println!("  ΔS = ceil/floor(in·2^64 / L)");
+    println!("  ΔS = floor(in·2^64 / L)");
     println!("                       {delta}");
     println!("  S' = S + ΔS          {reached}");
 
@@ -541,6 +542,29 @@ pub(crate) async fn follow(
                 report.unrecognised,
                 report.failures
             );
+            // A freshly tracked pool carries its price state but no ticks, and without ticks it
+            // cannot be quoted. Load them on first sight; a pool that churns faster than it can
+            // be read is warned about rather than retried forever.
+            for slot in manager.venues() {
+                if slot.ticks.is_some() {
+                    continue;
+                }
+                let AnyVenue::Cetus(pool) = &slot.venue else { continue };
+                match load_tick_nodes(
+                    session.objects.as_ref(),
+                    session.layouts.as_ref(),
+                    &pool.ticks,
+                    |_| {},
+                )
+                .await
+                {
+                    Ok(nodes) => match manager.install_ticks(slot.id, &pool.ticks, nodes) {
+                        Ok(ticks) => println!("  {} ticks {} loaded", slot.id, ticks.len()),
+                        Err(error) => println!("  {} ticks failed: {error:#}", slot.id),
+                    },
+                    Err(error) => println!("  {} ticks failed: {error:#}", slot.id),
+                }
+            }
         }
         if applied >= count {
             break;
@@ -590,7 +614,9 @@ pub(crate) async fn fetch(session: &Session, out: &std::path::Path) -> eyre::Res
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     fixtures.manifest.note = String::from(
-        "Checkpoints are filtered to the transactions that touch pool A, so the reassembled ",
+        "Checkpoints are filtered to the transactions that touch pool A, so the reassembled \
+         checkpoint's object set is a subset of the chain's and tick-node counts reflect the \
+         present dynamic-field index, not the checkpoint's version.",
     );
 
     // 1. The objects themselves.
@@ -636,6 +662,30 @@ pub(crate) async fn fetch(session: &Session, out: &std::path::Path) -> eyre::Res
         checkpoint.transactions.len()
     );
 
+    // 3b. Layouts for every venue-shaped object the checkpoint carries — including pools of
+    // other deployments touched by the kept transactions, which the commands above never decoded
+    // and the registry therefore never saw. Without this the capture would miss their packages
+    // and an offline replay could not type them.
+    let recorded = fixtures.checkpoint(TX_T_CHECKPOINT)?;
+    let mut extra = 0_usize;
+    for executed in &recorded.transactions {
+        for change in sui_types::effects::TransactionEffectsAPI::object_changes(&executed.effects) {
+            let Some(output_version) = change.output_version else { continue };
+            let key = ObjectKey(change.id, output_version);
+            let Some(object) = recorded.object_set.get(&key) else { continue };
+            let Some(tag) = object.struct_tag() else { continue };
+            if venue_kind_of(&tag).is_none() {
+                continue;
+            }
+            // An object the node pruned between calls is not worth failing the capture for;
+            // what matters is that everything still resolvable gets recorded.
+            if session.layouts.layout(&tag).await.is_ok() {
+                extra += 1;
+            }
+        }
+    }
+    println!("  checkpoint venue layouts pre-resolved {extra}");
+
     // 4. Layouts and the package bytecode they were resolved from.
     let mut addresses: std::collections::BTreeSet<AccountAddress> =
         std::collections::BTreeSet::new();
@@ -680,12 +730,58 @@ pub(crate) async fn fetch(session: &Session, out: &std::path::Path) -> eyre::Res
 
 #[cfg(test)]
 mod tests {
-    use super::move_in_ticks;
+    use birdai_venue::{NaviStorage, Venue, VenueKind, VoloNativePool, venue_kind_of};
+
+    use super::{load_pool, move_in_ticks};
+    use crate::{
+        constants::{POOL_A_PRE_VERSION, POOL_B, POOL_C, object_id},
+        session::Session,
+    };
 
     #[test]
     fn the_transaction_moves_less_than_one_tick() {
         // Mainnet: S and S' for transaction T.
         let moved = move_in_ticks(647_308_812_393_509_050_120, 647_324_162_169_833_037_484);
         assert!(moved < 1.0, "moved {moved} ticks");
+    }
+
+    /// Objects B and C decode offline as a vault and a ledger: neither carries price state.
+    ///
+    /// Skipped when the fixture set is absent, like the committed fixture tests: the fixtures
+    /// are required data, but a checkout without them should not look like a code failure.
+    #[tokio::test]
+    async fn vault_and_ledger_decode_offline_without_price_state() -> eyre::Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        if !dir.join("manifest.json").exists() {
+            return Ok(());
+        }
+        let session = Session::offline(&dir)?;
+
+        let decoded = session.decode(object_id(POOL_B)?, None).await?;
+        assert_eq!(venue_kind_of(&decoded.tag), Some(VenueKind::VoloNativePool));
+        let contents = decoded
+            .object
+            .data
+            .try_as_move()
+            .ok_or_else(|| eyre::eyre!("object B is not a Move object"))?
+            .contents();
+        let vault = VoloNativePool::decode(contents, &decoded.layout)?;
+        assert!(vault.price_state().is_none(), "a vault quotes no price");
+
+        let decoded = session.decode(object_id(POOL_C)?, None).await?;
+        assert_eq!(venue_kind_of(&decoded.tag), Some(VenueKind::NaviStorage));
+        let contents = decoded
+            .object
+            .data
+            .try_as_move()
+            .ok_or_else(|| eyre::eyre!("object C is not a Move object"))?
+            .contents();
+        let ledger = NaviStorage::decode(contents, &decoded.layout)?;
+        assert!(ledger.price_state().is_none(), "a ledger quotes no price");
+
+        // And the venue still does, at the version transaction T consumed.
+        let pool = load_pool(&session, Some(POOL_A_PRE_VERSION)).await?;
+        assert!(pool.price_state().is_some(), "the CLMM carries its price");
+        Ok(())
     }
 }

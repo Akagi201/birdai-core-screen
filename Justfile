@@ -28,6 +28,17 @@ lint:
 test:
   cargo test --all-features
 
+# Verify every git dependency is pinned by `rev` (not `branch`) and all revs are identical
+deps-check:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  revs=$(rg -o --no-filename 'rev = "[0-9a-f]+"' Cargo.toml crates/*/Cargo.toml bin/*/Cargo.toml | sort -u)
+  branches=$(rg --no-filename 'branch = "' Cargo.toml crates/*/Cargo.toml bin/*/Cargo.toml || true)
+  if [ -n "$branches" ]; then echo "branch-pinned dependencies found:"; echo "$branches"; exit 1; fi
+  count=$(echo "$revs" | wc -l | tr -d ' ')
+  if [ "$count" -ne 1 ]; then echo "git dependencies pin different revs:"; echo "$revs"; exit 1; fi
+  echo "all git dependencies pinned at $revs"
+
 # Run mutation tests with cargo-mutants
 mutation:
   cargo mutants

@@ -80,12 +80,13 @@ pub const TICK_PRICE_TOLERANCE_BITS: u32 = 48;
 /// The largest tolerance allowed for a given price: `computed >> TICK_PRICE_TOLERANCE_BITS`, but
 /// never less than one unit, so that small prices are still allowed to be off by one.
 #[must_use]
+#[inline]
 pub const fn tick_price_tolerance(computed: u128) -> u128 {
     let scaled = computed >> TICK_PRICE_TOLERANCE_BITS;
     if scaled == 0 { 1 } else { scaled }
 }
 
-/// `floor(1.0001^(tick/2) · 2^64)`, accurate to within [`TICK_PRICE_TOLERANCE`] of the value the
+/// `floor(1.0001^(tick/2) · 2^64)`, accurate to within [`tick_price_tolerance`] of the value the
 /// pool stores.
 ///
 /// Returns [`AmmError::InvalidTick`] outside `[MIN_TICK, MAX_TICK]`.
@@ -125,12 +126,12 @@ pub fn tick_at_sqrt_price(sqrt_price: u128) -> Result<i32, AmmError> {
         return Err(AmmError::InvalidSqrtPrice(0));
     }
 
-    let min_price = sqrt_price_at_tick(MIN_TICK)?;
-    if sqrt_price < min_price {
+    // The range ends are constants, not recomputed: each call below costs ~20 `U256`
+    // multiplications, and the ends never change.
+    if sqrt_price < MIN_SQRT_PRICE {
         return Ok(MIN_TICK);
     }
-    let max_price = sqrt_price_at_tick(MAX_TICK)?;
-    if sqrt_price >= max_price {
+    if sqrt_price >= MAX_SQRT_PRICE {
         return Ok(MAX_TICK);
     }
 

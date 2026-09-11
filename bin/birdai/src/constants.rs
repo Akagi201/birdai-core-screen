@@ -1,8 +1,9 @@
 //! The mainnet inputs this repository is about.
 //!
-//! Every value here was read from Sui mainnet and is asserted by the end-to-end tests in
-//! `tests/mainnet.rs`, so a drift in the fixtures or in the decoders fails the build rather than
-//! quietly changing the answer.
+//! Every value here was read from Sui mainnet and is asserted by tests that run against the
+//! committed fixture set (`birdai-resolve`'s `committed` module and `birdai-state`'s checkpoint
+//! replay), so a drift in the fixtures or in the decoders fails the build rather than quietly
+//! changing the answer.
 
 use sui_types::base_types::ObjectID;
 

@@ -62,6 +62,13 @@ impl<'b, 'l, D: StructDecoder<'b, 'l>> Visitor<'b, 'l> for StructVisitor<D> {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VecVisitor<V>(pub V);
 
+/// Upper bound on the elements pre-allocated from a vector's length prefix.
+///
+/// The length is untrusted BCS input: a corrupt `u64::MAX` prefix must not turn into a huge
+/// allocation. The walk still reads every element the driver yields; only the up-front
+/// reservation is capped.
+const MAX_VECTOR_PREALLOC: usize = 1_024;
+
 impl<'b, 'l, V> Visitor<'b, 'l> for VecVisitor<V>
 where
     V: Visitor<'b, 'l, Error = DecodeError>,
@@ -73,7 +80,8 @@ where
         &mut self,
         driver: &mut VecDriver<'_, 'b, 'l>,
     ) -> Result<Self::Value, Self::Error> {
-        let mut items = Vec::with_capacity(usize::try_from(driver.len()).unwrap_or(0));
+        let prealloc = usize::try_from(driver.len()).unwrap_or(0).min(MAX_VECTOR_PREALLOC);
+        let mut items = Vec::with_capacity(prealloc);
         while let Some(item) = driver.next_element(&mut self.0)? {
             items.push(item);
         }

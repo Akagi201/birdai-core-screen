@@ -34,13 +34,17 @@ pub enum DecodeError {
         /// The Rust type that rejected the value.
         target: &'static str,
     },
+
+    /// The BCS bytes did not match the layout, as reported by the annotation framework.
+    ///
+    /// Kept as a message rather than mapped to [`DecodeError::UnexpectedType`] so the
+    /// underlying reason stays diagnosable in logs and reports.
+    #[error("bytes did not match the layout: {0}")]
+    Annotation(String),
 }
 
 impl From<move_core_types::annotated_visitor::Error> for DecodeError {
     fn from(err: move_core_types::annotated_visitor::Error) -> Self {
-        // The annotated visitor's errors are all "the bytes did not match the layout", which from
-        // this crate's point of view is an unexpected type. Keep the message reachable for logs.
-        tracing::debug!(error = %err, "annotation error while decoding");
-        Self::UnexpectedType { expected: "a well-formed value matching the layout" }
+        Self::Annotation(err.to_string())
     }
 }

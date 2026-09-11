@@ -55,6 +55,11 @@ pub trait LayoutSource: Send + Sync {
     /// This is the hook that turns "a package was published or upgraded" into "the layouts that
     /// mention it are stale". Backends that cannot observe upgrades ignore it; the default is a
     /// no-op so the trait stays usable from fixtures and tests.
+    ///
+    /// Invalidation is **push-only**: a layout is re-checked against observed versions on read,
+    /// but versions only arrive through this hook. A poller that resolves layouts without ever
+    /// feeding checkpoints must call it from its own package observations, or it will serve
+    /// stale layouts after an upgrade.
     fn note_packages(&self, _versions: Vec<(AccountAddress, u64)>) {}
 }
 
@@ -169,18 +174,28 @@ impl<S> LayoutRegistry<S> {
         });
 
         let live = self.packages.load();
-        let mut dropped = 0_u64;
+        // Count the stale entries from the snapshot, then remove by key: `rcu` retries its
+        // closure under contention, so counting inside it would double-count. The count is
+        // approximate if another thread mutates the cache concurrently, which is fine for a
+        // metric — eviction itself still removes every stale entry the closure sees.
+        let dropped = self
+            .cache
+            .load()
+            .values()
+            .filter(|entry| {
+                entry
+                    .dependencies
+                    .iter()
+                    .any(|(address, version)| is_newer(&live, address, *version))
+            })
+            .count() as u64;
         self.cache.rcu(|current| {
             let mut next = (**current).clone();
             next.retain(|_, entry| {
-                let stale = entry
+                !entry
                     .dependencies
                     .iter()
-                    .any(|(address, version)| is_newer(&live, address, *version));
-                if stale {
-                    dropped += 1;
-                }
-                !stale
+                    .any(|(address, version)| is_newer(&live, address, *version))
             });
             Arc::new(next)
         });

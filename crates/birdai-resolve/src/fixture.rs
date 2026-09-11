@@ -355,7 +355,15 @@ impl Fixtures {
             Some(version) => versions.get(&version)?,
             None => latest(versions)?,
         };
-        decode(encoded).ok()
+        match decode(encoded) {
+            Ok(object) => Some(object),
+            // A corrupt entry is a broken capture, not a missing object: say so where the
+            // caller can see it instead of surfacing as `ObjectNotFound` three calls later.
+            Err(error) => {
+                tracing::warn!(object = %id.to_canonical_string(true), %error, "fixture entry failed to decode");
+                None
+            }
+        }
     }
 
     /// Every version of an object held.
@@ -369,7 +377,14 @@ impl Fixtures {
 
     /// A package, by the address layouts reference it with.
     pub fn package(&self, address: &AccountAddress) -> Option<Object> {
-        decode(self.packages.get(&address.to_canonical_string(true))?).ok()
+        let encoded = self.packages.get(&address.to_canonical_string(true))?;
+        match decode(encoded) {
+            Ok(object) => Some(object),
+            Err(error) => {
+                tracing::warn!(package = %address.to_canonical_string(true), %error, "fixture package failed to decode");
+                None
+            }
+        }
     }
 
     /// A layout, by canonical tag.
@@ -398,8 +413,16 @@ impl Fixtures {
         let mut object_set = ObjectSet::default();
         for versions in captured.objects.values() {
             for encoded in versions.values() {
-                if let Ok(object) = decode(encoded) {
-                    object_set.insert(object);
+                match decode(encoded) {
+                    Ok(object) => {
+                        object_set.insert(object);
+                    }
+                    // Dropping a corrupt entry silently would shrink the checkpoint's object
+                    // set and break input resolution downstream; warn so a bad capture is
+                    // loud at load time.
+                    Err(error) => {
+                        tracing::warn!(%error, "fixture checkpoint entry failed to decode");
+                    }
                 }
             }
         }

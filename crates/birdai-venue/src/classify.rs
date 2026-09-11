@@ -137,7 +137,7 @@ pub struct SwapEntry {
 }
 
 /// Where an oracle dependency was found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OracleReference {
     /// Package address.
     pub package: String,
@@ -148,7 +148,7 @@ pub struct OracleReference {
 }
 
 /// How an oracle reference was discovered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OracleVia {
     /// The defining module links the oracle module.
     ModuleDependency,
@@ -357,7 +357,7 @@ impl Classifier {
                 }
             }
         }
-        oracle_references.sort_by(|a, b| a.module.cmp(&b.module));
+        oracle_references.sort();
         oracle_references.dedup();
 
         tracing::debug!(
@@ -389,26 +389,26 @@ impl Classifier {
         function: &str,
     ) -> Result<Option<SwapEntry>, VenueError> {
         let package = layouts.package(package).await?;
-        let module = package.module(module).map_err(|error| VenueError::Module {
+        let resolved = package.module(module).map_err(|error| VenueError::Module {
             package: package.storage_id().to_canonical_string(true),
             module: format!("{module} ({error})"),
         })?;
-        let definition = module
+        let definition = resolved
             .function_def(function)
             .map_err(|error| VenueError::Function {
-                module: function.to_owned(),
+                module: module.to_owned(),
                 function: function.to_owned(),
                 message: error.to_string(),
             })?
             .ok_or_else(|| VenueError::Function {
-                module: function.to_owned(),
+                module: module.to_owned(),
                 function: function.to_owned(),
                 message: "the function is not in the module the transaction named".to_owned(),
             })?;
         if !is_callable(&definition) {
             return Ok(None);
         }
-        Ok(swap_shape(module.name(), function, &definition, EntryEvidence::ObservedCall))
+        Ok(swap_shape(resolved.name(), function, &definition, EntryEvidence::ObservedCall))
     }
 
     /// Turn static evidence, plus an optional observed price move, into a verdict.
@@ -628,10 +628,16 @@ fn coin_input_type_parameter(body: &OpenSignatureBody) -> Option<u16> {
 ///
 /// `allow_balance` distinguishes the two directions an exchange can be expressed in: a `Coin` is
 /// always a leg, while a `Balance` is one only on the return side.
+///
+/// Both are matched by address as well as by name: only `0x2`'s coin and balance are the
+/// framework's asset wrappers, and a same-named struct from another package is not a leg.
 fn coin_type_parameter(body: &OpenSignatureBody, allow_balance: bool) -> Option<u16> {
     let OpenSignatureBody::Datatype(key, arguments) = body else {
         return None;
     };
+    if key.package != AccountAddress::TWO {
+        return None;
+    }
     let is_coin = key.module == "coin" && key.name == "Coin";
     let is_balance = key.module == "balance" && key.name == "Balance";
     if !(is_coin || (allow_balance && is_balance)) {
@@ -832,6 +838,11 @@ fn collect_types(layout: &MoveTypeLayout, out: &mut Vec<String>) {
         }
         MoveTypeLayout::Enum(inner) => {
             out.push(short_tag(&inner.type_));
+            for fields in inner.variants.values() {
+                for field in fields {
+                    collect_types(&field.layout, out);
+                }
+            }
         }
         other => out.push(birdai_move::dump::short_type_of(other)),
     }
@@ -844,5 +855,98 @@ pub fn held_asset(tag: &StructTag) -> Option<&StructTag> {
     match inner {
         move_core_types::language_storage::TypeTag::Struct(tag) => Some(tag),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use move_core_types::{
+        account_address::AccountAddress,
+        annotated_value::{MoveEnumLayout, MoveFieldLayout, MoveStructLayout, MoveTypeLayout},
+        identifier::Identifier,
+        language_storage::StructTag,
+    };
+
+    use super::{OracleDenySet, PriceStateChange, referenced_types};
+    use crate::venue::PriceState;
+
+    fn ident(text: &str) -> Identifier {
+        Identifier::new(text).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn tag(module: &str, name: &str) -> StructTag {
+        StructTag {
+            address: AccountAddress::TWO,
+            module: ident(module),
+            name: ident(name),
+            type_params: vec![],
+        }
+    }
+
+    #[test]
+    fn deny_set_matches_names_case_insensitively_and_addresses_exactly() {
+        let deny = OracleDenySet::default_mainnet();
+        assert!(deny.matches(&AccountAddress::ONE, "PriceOracle"));
+        assert!(deny.matches(&AccountAddress::ONE, "pyth"));
+        assert!(!deny.matches(&AccountAddress::ONE, "pool"));
+        let deny = deny.with_address(AccountAddress::ONE);
+        assert!(deny.matches(&AccountAddress::ONE, "anything_at_all"));
+        assert!(!deny.matches(&AccountAddress::TWO, "anything_at_all"));
+    }
+
+    #[test]
+    fn referenced_types_descend_into_enum_variants() {
+        let oracle = MoveTypeLayout::Struct(Box::new(MoveStructLayout {
+            type_: tag("oracle", "PriceOracle"),
+            fields: vec![],
+        }));
+        let mut variants = BTreeMap::new();
+        variants.insert(
+            (ident("V0"), 0),
+            vec![MoveFieldLayout { name: ident("feed"), layout: oracle }],
+        );
+        let layout =
+            MoveTypeLayout::Enum(Box::new(MoveEnumLayout { type_: tag("coin", "Coin"), variants }));
+        let types = referenced_types(&layout);
+        assert!(
+            types.iter().any(|rendered| rendered.contains("PriceOracle")),
+            "an oracle nested in a variant must be reported: {types:?}"
+        );
+    }
+
+    fn change(
+        a_delta: i128,
+        b_delta: i128,
+        before_price: u128,
+        after_price: u128,
+        oracles: Vec<String>,
+    ) -> PriceStateChange {
+        PriceStateChange {
+            before: PriceState { sqrt_price: before_price, liquidity: 1, tick: 0 },
+            after: PriceState { sqrt_price: after_price, liquidity: 1, tick: 0 },
+            coin_a_delta: a_delta,
+            coin_b_delta: b_delta,
+            oracle_inputs: oracles,
+        }
+    }
+
+    #[test]
+    fn endogenous_means_the_price_followed_the_flow() {
+        // B in, price up: the trade moved the price.
+        assert!(change(-10, 10, 100, 101, vec![]).is_endogenous());
+        // A in, price down.
+        assert!(change(10, -10, 101, 100, vec![]).is_endogenous());
+        // B in, price down: something else moved it.
+        assert!(!change(-10, 10, 101, 100, vec![]).is_endogenous());
+        // No flow at all, even with a price move: not a trade.
+        assert!(!change(0, 0, 100, 101, vec![]).is_endogenous());
+        // A price that did not move is not discovery either.
+        assert!(!change(-10, 10, 100, 100, vec![]).is_endogenous());
+        // An oracle among the inputs vetoes the probe, however clean the move looks.
+        assert!(
+            !change(-10, 10, 100, 101, vec!["0x1::oracle::PriceOracle".to_owned()]).is_endogenous()
+        );
     }
 }

@@ -17,14 +17,14 @@ thin, well-factored layer on top of the Sui crates rather than a reimplementatio
 
 | Graded item | Implementation | Evidence |
 |---|---|---|
-| Decode A/B/C + a tick child | `move_core_types::annotated_visitor` visitors + `annotated_extractor` + `sui_package_resolver::Resolver` | `cargo run -- decode --all` |
-| Classify | Structural bytecode probe over `FunctionDef`/`OpenSignature` + empirical price-state probe | `cargo run -- classify --all` |
+| Decode A/B/C + a tick child | `move_core_types::annotated_visitor` visitors + `annotated_extractor` + `sui_package_resolver::Resolver` | `cargo run -- decode` |
+| Classify | Structural bytecode probe over `FunctionDef`/`OpenSignature` + empirical price-state probe | `cargo run -- classify` |
 | Recreate T | `birdai-amm` integer CLMM math on the pre-state | `cargo run -- reproduce` → **81 168 759, matches chain** |
 | Design note | `birdai-state` on `sui-indexer-alt-framework::ingestion` | `cargo run -- follow --from 320577815` + README §4 |
 
-Pinned upstream: Sui mainnet branch `main` @ **`c8755d9c05209a22d91c07df76458992defd99c4`** (2026-09-09),
-toolchain **1.96.1**, edition 2024. This is the tip of `main` as of writing (verified with
-`git ls-remote`).
+Pinned upstream: Sui `main` @ **`b0535f1f3a3310e71790e90d8ae4e8ca840c897e`**,
+toolchain **1.96.1**, edition 2024. `just deps-check` enforces the pin: every git dependency
+names a `rev`, and all revs are identical (verified — the whole workspace moves atomically).
 
 ---
 
@@ -76,9 +76,11 @@ Note `I32` lives in a **different package** from the pool
 (`0x714a63a0dba6da4f017b42d5d0fb78867f18bcde904868e51d951a5a6f5b7f57`), and the skip list in a third
 (`0xbe21a061…`). Three packages, three upgrade clocks — see §8.5.
 
-Latest state (version 996382523): `coin_a = 254_548_174_454`, `coin_b = 551_726_244_467_576`,
+Latest state (version 996382523, observed at research time — the pool trades continuously, so
+live runs sit higher): `coin_a = 254_548_174_454`, `coin_b = 551_726_244_467_576`,
 `liquidity = 68_693_527_635_052`, `current_sqrt_price = 673_624_336_522_390_633_733`,
-`current_tick_index = 71959`.
+`current_tick_index = 71959`. The captured fixture set holds 653 tick nodes for the current
+version (which declares 654); the pre-T version declares 650.
 
 ### 1.2 Fixed-point format — derived, not assumed
 
@@ -158,7 +160,6 @@ SUI_REV = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e"
 sui-types                 = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
 sui-package-resolver      = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
 sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
-sui-rpc-resolver          = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
 sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e", default-features = false }
 move-core-types           = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
 move-binary-format        = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
@@ -204,13 +205,14 @@ build requires network, which is normal for git dependencies and is called out i
 | Fetch object by id / version | `sui_rpc_api::Client::{get_object, get_object_with_version, get_object_with_json, batch_get_objects}` → `sui_types::object::Object` | `crates/sui-rpc-api/src/client/mod.rs:120,124,144,185` |
 | Fetch checkpoint / tx | `Client::get_full_checkpoint(seq) -> Checkpoint`, `Client::get_transaction(digest) -> ExecutedTransaction`, `Client::get_latest_checkpoint()` | same, `:98,318,63` |
 | List dynamic fields | `Client::get_dynamic_fields(parent: ObjectID, page_size, page_token) -> ListDynamicFieldsResponse` | `:421` |
-| Layout resolution | `sui_rpc_resolver::package_store::RpcPackageStore::new(url).with_cache()` + `sui_package_resolver::Resolver::new(store)` → `Resolver::type_layout(TypeTag) -> MoveTypeLayout` | `crates/sui-package-resolver/src/lib.rs:404` |
+| Layout resolution | `sui_package_resolver::Resolver::new_with_limits(store, limits)` → `Resolver::type_layout(TypeTag) -> MoveTypeLayout` | `crates/sui-package-resolver/src/lib.rs:404` |
+| Package bytecode for any source | `birdai_resolve::store::SourcePackageStore<O: ObjectSource>` implements `PackageStore` over the same source that serves objects — gRPC, fixtures, or a validator's object store | `crates/birdai-resolve/src/store.rs` |
 | Bytecode / signatures | `Resolver::package_store().fetch(addr) -> Arc<Package>`; `Package::module(name) -> Module`; `Module::{functions, function_def} -> FunctionDef` | `lib.rs:305,749,1059,1076` |
 | Type canonicalisation | `Resolver::canonical_type(TypeTag) -> TypeTag`, `Resolver::abilities(TypeTag)` | `lib.rs:382,432` |
 | BCS → typed, single pass | `move_core_types::annotated_visitor::{Visitor, Traversal, ValueDriver, StructDriver, VecDriver, VariantDriver, NullTraversal, visitor_default!}` | `…/move-core-types/src/annotated_visitor.rs` |
 | Path projection | `move_core_types::annotated_extractor::{Extractor, Element::{Field, Index, Type, Variant}}` | `…/annotated_extractor.rs` |
 | BCS → annotated tree (dumps) | `sui_types::object::bounded_visitor::BoundedVisitor::{deserialize_value, deserialize_struct}` | `crates/sui-types/src/object/bounded_visitor.rs:81,96` |
-| BCS → JSON (cross-check) | `sui_rpc_resolver::json_visitor::JsonVisitor::deserialize_value(bytes, &layout)` | `crates/sui-rpc-resolver/src/json_visitor.rs:60` |
+| BCS → JSON (research cross-check) | The node's `contents { json }` over GraphQL, compared by eye during research — deliberately not a dependency: no GraphQL client ships in this repo | Appendix A |
 | Zero-copy dynamic field | `sui_types::dynamic_field::visitor::FieldVisitor` → `Field { name_bytes: &'b [u8], value_bytes: &'b [u8], .. }` | `crates/sui-types/src/dynamic_field/visitor.rs:19` |
 | Dynamic field id derivation | `sui_types::dynamic_field::{derive_dynamic_field_id, Field}` | `crates/sui-types/src/dynamic_field.rs:269,40` |
 | 256-bit integer math | `move_core_types::u256::U256` (`checked_mul`, `checked_div`, `TryFrom<U256> for u128`) | `…/move-core-types/src/u256.rs:280-454` |
@@ -230,7 +232,7 @@ Everything here is either absent from the Sui crates or is the graded answer.
 | `birdai-tick` | Cetus skip-list layout and `score = tick_index + 443636` bias are protocol-specific. |
 | `birdai-venue` | Venue semantics + the classification judgement: the graded reasoning. |
 | `birdai-state` | `sui_indexer_alt_framework::pipeline::*` requires a `Store` (Diesel/Postgres or a custom impl) and is DB-shaped; the exercise asks for in-memory typed state. |
-| `birdai-move` | Protocol newtypes (`I32`, `I128`, `OptionU64`) and the `MoveStruct` derive that turns a layout-driven visitor into a typed struct. |
+| `birdai-move` | Protocol newtypes (`I32`, `I128`, `OptionU64`), the `StructDecoder` trait that turns a layout-driven visitor into a typed struct, and the `Dump` renderer. |
 | `birdai-resolve` | `PackageStoreWithLruCache` has **no upgrade hook**: it re-fetches a package only when the package object itself is fetched again, and never invalidates a *dependent* type's cached layout. Package upgrades are one of the three hard problems in task 4. |
 
 `bin/birdai` is the CLI.
@@ -255,57 +257,53 @@ Everything here is either absent from the Sui crates or is the graded answer.
         +--------------+--------+--------+---------------+
                                 |
                           birdai-move
-                  (I32/I128/OptionU64, MoveStruct derive,
+                  (I32/I128/OptionU64, StructDecoder, Dump,
                    reusable visitors, dump renderer)
                                 |
         =========== Sui crates (pinned git rev) ===========
-   sui-types · sui-package-resolver · sui-rpc-api · sui-rpc-resolver
+   sui-types · sui-package-resolver · sui-rpc-api
    sui-indexer-alt-framework · move-core-types · move-binary-format
 ```
 
 Dependency edges only point downward; `birdai-amm` has **no I/O and no Sui dependency** beyond
 `move-core-types::u256` (it is pure integer math and can be property-tested in microseconds).
 
-### 4.1 The four seams
+### 4.1 The seams (as built)
 
 ```rust
-/// 1. Where typed state comes from. Implemented by the gRPC client, the checkpoint stream, and fixtures.
+/// Where raw objects come from. Implemented by the gRPC client and by fixtures.
 #[async_trait]
 pub trait ObjectSource: Send + Sync {
-    async fn object(&self, id: ObjectID, version: Option<SequenceNumber>) -> Result<Object>;
-    async fn object_at_checkpoint(&self, id: ObjectID, cp: u64) -> Result<Object>;
-    async fn dynamic_fields(&self, parent: ObjectID, cursor: Option<Bytes>) -> Result<Page<DynamicField>>;
+    async fn object(&self, id: ObjectID, version: Option<u64>) -> Result<Object, ResolveError>;
+    async fn checkpoint(&self, sequence_number: u64) -> Result<Checkpoint, ResolveError>;
+    async fn dynamic_fields(&self, parent: ObjectID, cursor: Option<Bytes>)
+        -> Result<DynamicFieldPage, ResolveError>;
+    async fn chain_id(&self) -> Result<String, ResolveError>;
+    async fn latest_checkpoint(&self) -> Result<u64, ResolveError>;
+    // `objects(&[ObjectID])`: batched with a bounded-concurrency fallback. The default is
+    // sequential; the gRPC backend overrides it.
 }
 
-/// 2. Where layouts come from, with package-upgrade awareness layered on top.
+/// Where layouts come from, with package-upgrade awareness layered on top.
 #[async_trait]
 pub trait LayoutSource: Send + Sync {
-    async fn layout(&self, tag: &StructTag) -> Result<Arc<MoveTypeLayout>>;
-    async fn canonical(&self, tag: &StructTag) -> Result<StructTag>;
-    async fn module(&self, pkg: ObjectID, module: &str) -> Result<Arc<Module>>;
+    async fn layout(&self, tag: &StructTag) -> Result<Arc<MoveTypeLayout>, ResolveError>;
+    async fn canonical(&self, tag: &StructTag) -> Result<StructTag, ResolveError>;
+    async fn package(&self, address: AccountAddress) -> Result<Arc<Package>, ResolveError>;
+    // `note_packages(versions)`: the upgrade hook; a no-op by default.
 }
 
-/// 3. Where raw objects come from (checkpoint stream, validator, or replay file).
-pub trait RawObjectSource {
-    fn id(&self) -> ObjectID;
-    fn version(&self) -> SequenceNumber;
-    fn struct_tag(&self) -> Option<StructTag>;
-    fn contents(&self) -> &[u8];
-    fn owner(&self) -> &Owner;
-}
-
-/// 4. How a typed venue is produced from bytes + layout.
+/// How a typed venue is produced from bytes + layout.
 pub trait Venue: Sized + Send + Sync + 'static {
     const KIND: VenueKind;
-    fn decode(bytes: &[u8], layout: &MoveTypeLayout, ctx: &DecodeCtx<'_>) -> Result<Self>;
+    fn decode(bytes: &[u8], layout: &MoveTypeLayout) -> Result<Self, VenueError>;
     fn price_state(&self) -> Option<PriceState>;      // powers classification probe 2 and pricing
 }
 ```
 
-`RawObjectSource` is implemented by `sui_types::object::Object` directly (a two-line impl), which is the
-whole point: the checkpoint object **is** `sui_types::object::Object`, so our boundary is
-`Object` → `Venue`, with bytes/tag/version as the only inputs. §8.4 shows what changes when the source is
-a validator.
+There is no separate raw-object trait: the checkpoint object **is** `sui_types::object::Object`,
+so the boundary is `Object` → `Venue`, with bytes/tag/version as the only inputs. §8.4 shows what
+changes when the source is a validator.
 
 ---
 
@@ -318,34 +316,29 @@ Primary path is **gRPC v2** (`sui_rpc_api::Client`), not GraphQL:
 ```rust
 let mut client = sui_rpc_api::Client::new("https://fullnode.mainnet.sui.io:443")?;
 let obj: sui_types::object::Object = client.get_object_with_version(pool_id, version)?.into();
-let mv = obj.data.try_as_move().expect("move object");
-let tag: StructTag = obj.struct_tag().unwrap();
+let mv = obj.data.try_as_move().ok_or_else(|| eyre::eyre!("not a Move object"))?;
+let tag: StructTag = obj.struct_tag().ok_or_else(|| eyre::eyre!("no type tag"))?;
 // contents: &[u8] == mv.contents()
 ```
 
 Why gRPC over GraphQL: it returns a **native `sui_types::object::Object`** (the same type the checkpoint
-stream carries), it supports read masks, batching and dynamic-field paging, and `sui_rpc_resolver`
-already wraps it as a `PackageStore`. GraphQL is kept as a cross-check channel (its `contents { json }` is
-the "pre-parsed JSON" the task allows for verification) and as a fallback for
-`Address.dynamicFields` on inner UIDs — verified working during research.
+stream carries), it supports read masks, batching and dynamic-field paging, and `SourcePackageStore`
+wraps the same client as a `PackageStore`. GraphQL was used during research as a cross-check channel
+(its `contents { json }` is the "pre-parsed JSON" the task allows for verification) and to confirm
+`Address.dynamicFields` reaches inner UIDs — no GraphQL client ships in this repo.
 
 ### 5.2 Layout
 
 ```rust
-let store  = sui_rpc_resolver::package_store::RpcPackageStore::new(RPC_URL).with_cache();
-let resolver = sui_package_resolver::Resolver::new_with_limits(
-    store,
-    sui_package_resolver::Limits {
-        max_type_argument_depth: 16,
-        max_type_argument_width: 16,
-        max_type_nodes: 256,
-        max_move_value_depth: 128,
-    },
-);
-let layout: MoveTypeLayout = resolver
-    .type_layout(TypeTag::Struct(Box::new(pool_tag.clone())))
-    .await?;
+let source = Arc::new(GrpcObjectSource::with_endpoints(rpc_url, api_key, archive_url)?);
+let registry = layout_registry_over(source); // LayoutRegistry<SourcePackageStore<GrpcObjectSource>>
+let layout: Arc<MoveTypeLayout> = registry.layout(&pool_tag).await?;
 ```
+
+The resolver underneath is `sui_package_resolver::Resolver::new_with_limits` with
+`Limits { max_type_argument_depth: 16, max_type_argument_width: 16, max_type_nodes: 256,
+max_move_value_depth: 64 }` (see `LAYOUT_LIMITS`); the registry adds the upgrade-aware cache
+on top.
 
 Two properties of `Resolver::type_layout` that drive the rest of the design:
 
@@ -437,7 +430,8 @@ place to get lost:
   `address(address: <innerUid>) { dynamicFields }`, which returned
   `MoveValue` of type `…::skip_list::Node<…::tick::Tick>` keyed by `u64`.
 * gRPC `Client::get_dynamic_fields(parent = inner_uid, …)` reads the same index and is the primary path;
-  M1 includes an integration test that cross-checks the gRPC and GraphQL pages element-for-element.
+  the committed fixtures pin the round trip: their tick children are reachable through the inner
+  UID's owner index, which is exactly what the live pagination returns.
 
 Node key semantics (derived and verified):
 
@@ -486,15 +480,16 @@ silently misprices every quote.
   [  76.. 92] current_sqrt_price                :- 647308812393509050120  (Q64.64 → 35.0906810333)
   [  92.. 96] current_tick_index.bits           :- 71162   (I32 → 71162)
   …
-  tick_manager.ticks.id                        ⇒ 0x7f07284d…  (inner UID; 653 dynamic-field children)
+  tick_manager.ticks.id                        ⇒ 0x7f07284d…  (inner UID; 648 dynamic-field children at capture)
 ```
 
 Every offset is taken from `ValueDriver::{start, position}` and is asserted in tests against
 `bcs::to_bytes` round-trips.
 
-`--check` additionally fetches the node's `contents { json }` and deep-diffs it against our decode, so the
-"do not use the node's pre-parsed JSON as your decoder, it is fine for checking your answers" requirement
-is satisfied mechanically rather than by claim.
+The "do not use the node's pre-parsed JSON as your decoder, it is fine for checking your answers"
+requirement is satisfied structurally rather than by claim: no JSON path exists anywhere in the
+decode stack — every command decodes BCS bytes against a resolved layout, and the node's JSON was
+only ever compared by eye during research.
 
 ---
 
@@ -509,18 +504,29 @@ behavioural**, and every clause is mechanically decidable:
 > all three hold.
 
 **(1) Inter-asset swap entry (static, from bytecode).**
-Let `M` be the module that defines `T`, and `ps = T.type_params`. There must exist a function
-`f ∈ M` with `f.visibility == Public` (or `f.is_entry == true`) such that, for two **distinct indices**
-`i ≠ j` into `f.type_params`:
+Let `P` be the package that defines `T`. Some module of `P` must expose a function
+`f` with `f.visibility == Public` (or `f.is_entry == true`) such that, for two **distinct indices**
+`i ≠ j` into the venue's type parameters:
 
-* some parameter is `OpenSignature { ref_: Some(Mutable), body: Datatype(T, args) }` — a `&mut T`;
-* some parameter is `Datatype(0x2::coin::Coin | 0x2::balance::Balance, [TypeParameter(i)])`;
-* some parameter is `Datatype(0x2::coin::Coin, [TypeParameter(i)])` **and** some return is
-  `Datatype(0x2::coin::Coin | 0x2::balance::Balance, [TypeParameter(j)])` with `j ≠ i`.
+* some parameter is `OpenSignature { ref_: Some(Mutable), body: Datatype(D, args) }` where `D`'s
+  arguments mention a type parameter — a `&mut` borrow of generic state;
+* some parameter is `Datatype(0x2::coin::Coin, [TypeParameter(i)])` — a coin taken **in** (`Balance`
+  parameters do not count: a caller-supplied deposit is not an exact-input leg);
+* some return is `Datatype(0x2::coin::Coin | 0x2::balance::Balance, [TypeParameter(j)])` with
+  `j ≠ i` — a different asset coming **out**.
+
+The scan covers the **whole defining package**, not just the module that defines `T`: Cetus's
+`pool` module has no swap at all — its 77 functions were scanned and none has the inter-asset
+shape — so a module-scoped probe reports a false negative on the clearest venue in the set.
+Separately, the `package::module::function` the chain actually executed is resolved and tested
+with a looser shape (legs on two type parameters, direction carried by a `bool` rather than the
+types, as in `pool_script_v2::swap_b2a`), because the signature of the function that really ran
+is the strongest available evidence.
 
 Read directly off `FunctionDef { visibility, is_entry, type_params, parameters: Vec<OpenSignature>, return_ }`
 (`sui-package-resolver/src/lib.rs:227-243`), with `OpenSignatureBody::Datatype(DatatypeKey, Vec<OpenSignatureBody>)`
-and `OpenSignatureBody::TypeParameter(u16)`. No field-name heuristics, no registry, no ABI-string parsing.
+and `OpenSignatureBody::TypeParameter(u16)`. Coin and balance are matched by address (`0x2`) as
+well as by name. No field-name heuristics, no registry, no ABI-string parsing.
 
 **(2) Endogenous price state (empirical, from two versions).** `O` carries a numeric state variable (or
 tuple) whose value is a pure function of `O`'s own fields, and that variable **moves monotonically with net
@@ -540,8 +546,9 @@ and each vendor's local `oracle`/`price_oracle` module).
 **Object A — `0x1eabed72…::pool::Pool<USDC, SUI>` (Cetus CLMM): yes.** The pool's own state carries
 `liquidity`, `current_sqrt_price` (Q64.64) and `current_tick_index`, plus a skip list of initialised ticks
 with `liquidity_net`; the marginal price is `(sqrt_price/2^64)²` adjusted by the active liquidity, a pure
-function of the object's own fields. Probe (1) matches `pool::swap`: `&mut Pool<A,B>` plus `Coin<B>` in and
-`Coin<A>` out. Probe (2) holds concretely — transaction T moves `current_sqrt_price` from
+function of the object's own fields. Probe (1) is satisfied by the entry the chain executed,
+`pool_script_v2::swap_b2a`: `(&GlobalConfig, &mut Pool<T0, T1>, Coin<T0>, Coin<T1>, bool, …)` —
+a mutable borrow of the pool's generic state with coin legs on both of its type parameters. Probe (2) holds concretely — transaction T moves `current_sqrt_price` from
 `647_308_812_393_509_050_120` to `647_324_162_169_833_037_484` while `coin_a` falls and `coin_b` rises,
 with no price feed among the inputs. Every unit of price in this object is discovered by trading against
 it. **Passes all three probes.**
@@ -698,66 +705,75 @@ with `ExecutedTransaction::{input_objects, output_objects, created_objects}` res
 ### 8.2 The write path
 
 ```
-Arc<Checkpoint>
- └─ for each ExecutedTransaction (par_iter over the checkpoint)
-      ├─ effects.published_packages()            → LayoutRegistry::on_package_published(ids)
-      ├─ effects.object_changes()                → for each change {id, in_v, out_v}:
-      │     ├─ out_v.is_none()  ⇒ tombstone(id)                 // deleted / wrapped
-      │     └─ else ⇒ out = object_set[(id, out_v)]
-      │            ├─ if out.owner is ObjectOwner(parent) ⇒ ChildIndex.upsert(parent, out)
-      │            ├─ else if out.struct_tag() ∈ registered venue tags ⇒ decode → Slot::publish
-      │            └─ else ⇒ ignore (we index only what we price)
-      └─ effects.unchanged_consensus_objects()   → liveness bookkeeping only
- └─ commit(): one ArcSwap swap publishes the new CheckpointCursor  (single writer)
+&Checkpoint
+ └─ package observations                       → layouts.note_packages(versions)
+ └─ for each ExecutedTransaction, in order
+      └─ effects.object_changes()              → for each change {id, in_v, out_v}:
+           ├─ out_v.is_none()  ⇒ tombstone(id) + drop its child entries
+           └─ else ⇒ out = object_set[(id, out_v)]  (missing ⇒ counted failure, not fatal)
+                  ├─ venue-shaped tag ⇒ candidate for decode
+                  └─ dynamic-field tag ⇒ (parent, field_id) for the child index
+ └─ distinct tags resolved once                → layouts.layout(tag)
+ └─ BCS copied out, decoded on the blocking pool (rayon via spawn_blocking)
+ └─ publish per object (version-monotone; equal is a retried-checkpoint no-op)
+ └─ children indexed only for tracked pools' inner UIDs (bounded per parent)
+ └─ checkpoints += 1; last_applied = sequence   (duplicate delivery skips whole)
 ```
 
-* **Readers see a consistent snapshot**: each slot is `ArcSwap<Versioned<T>>`; the checkpoint cursor is
-  published last, so a reader either sees the whole checkpoint or none of it.
-* **Parallel decode**: `rayon` over the changed objects; the Sui crates are `Sync` where it matters
-  (`Resolver`, `Package`, `CompiledModule`, `MoveTypeLayout`), and `Resolver::type_layout` is `async`, so
-  we pre-resolve the distinct tags of the checkpoint in one batch, then decode synchronously.
-* **Lock-free reads**: `scc::HashMap<ObjectID, Slot>`, and the tick index is a `BTreeMap<i32, Tick>` behind
-  the same `ArcSwap` publication, so a pricing thread never blocks a writer.
+* **No atomic snapshot — and that is documented, not hidden.** Each slot is an immutable
+  `Arc<VenueSlot>` in an `scc::HashMap`, replaced per object; the checkpoint counter moves last
+  as a monotone watermark, not a barrier. A reader that arrives mid-checkpoint can see a mix of
+  old and new slots. A single slot is always consistent; two slots are not guaranteed to be from
+  the same checkpoint, and pricing code is written to that contract.
+* **Parallel decode without stalling the stream**: the BCS is copied out of the checkpoint and
+  decoded with `rayon` on the blocking pool (`tokio::task::spawn_blocking`), because the layouts
+  are already in hand and an `async` worker must not sit on CPU-bound work. The Sui crates are
+  `Sync` where it matters, and `Resolver::type_layout` is `async`, so distinct tags are
+  pre-resolved in one pass, then decoding is synchronous.
+* **Lock-free reads**: `scc::HashMap<ObjectID, Arc<VenueSlot>>` plus a second map for children;
+  atomics carry the counters. A pricing thread never blocks a writer.
+* **Duplicates and regressions**: a checkpoint at or below `last_applied` is a duplicate delivery
+  and skips whole; within a checkpoint, an incoming version older than the slot's is
+  `OutOfOrder` (an error — it would silently serve a stale price), while the same version is a
+  no-op. This is what makes re-applying a checkpoint that touched one object several times safe.
 
 ### 8.3 The three hard problems
 
-**New pools.** Venue identity is by **`StructTag` shape + the §6 classifier**, not by an allow-list. On
-first sight of a tag we run the static probes; if it is a venue we register a `VenueKind`, compile its
-`Extractor` paths, and start tracking it. A newly deployed pool of a known protocol is picked up by its
-defining package address; a brand-new protocol is picked up if it passes the probes, and is flagged
-`unverified` until its price agrees with a reference venue to within a tolerance.
+**New pools.** Venue identity starts from **`module::name`** (see `venue_kind_of`), not from an
+allow-list, so a pool deployed under a new package is picked up on first sight. The name is only
+a hint: the resolved layout's field set is the test (`layout_has_shape`), and a same-named struct
+with a different layout is counted as `unrecognised`, not `failed` — several mainnet packages
+define their own `pool::Pool`.
 
 **Dynamic-field churn.** Children are separate objects whose owner is an **inner UID**, so they do not
-look like children at all in the change set. `ChildIndex` therefore keys on
-`derive_dynamic_field_id(parent_uid, key_type, key_bcs)` (available from `sui_types::dynamic_field`), and
-three arrival paths are handled uniformly:
+look like children at all in the change set. The manager routes them by
+`Owner::ObjectOwner(parent)` and indexes **only the inner UIDs of tracked Cetus pools** — a
+lending ledger's ~999k user entries are never indexed at all — with each parent's set bounded by
+a capacity whose drops are counted and warned, not silent. A deleted parent's entries die with it.
+Tick nodes are dense enough (hundreds) to index fully, which is what makes tick-range pricing
+O(log n).
 
-1. **The child object itself appears** in the changed set → decode with
-   `sui_types::dynamic_field::visitor::FieldVisitor`, which yields `Field { name_bytes: &'b [u8],
-   value_bytes: &'b [u8], .. }` — zero-copy, and exactly enough to key the child without materialising it;
-2. **The child is deleted or wrapped** (`effects.deleted()` / `wrapped()`) → patch the parent from the
-   `ObjectRef` alone; no contents needed;
-3. **The parent's `Table`/`Bag`/`SkipList` `size` field changes** → used **only as a consistency
-   assertion** against `ChildIndex::len()`. A mismatch is a metric plus a forced resync of that parent,
-   because a drifted child index is the failure mode that silently misprices everything downstream.
-
-Backpressure matters here: a single Navi `Storage` has ~999k `user_info` children and pool A has 653 tick
-nodes, so `ChildIndex` is **bounded per parent** by an LRU tail and only tracks parents we actually price
-(`TrackedParent` registration). Tick nodes are the exception — they are dense enough (653) to index fully,
-which is what makes tick-range pricing O(log n).
+The skip list's declared `size` is used **only as a consistency signal**: `Ticks::new` (same-state
+reads) asserts it, while `Ticks::from_children` (children read at the present against historical
+metadata) downgrades a mismatch to a reported `SizeSkew`, because dynamic fields can only be
+listed as of now. A mismatch is reported rather than hidden, because a drifted child index is the
+failure mode that silently misprices everything downstream.
 
 **Package upgrades that change layouts.** This is the gap `PackageStoreWithLruCache` does not close: it
 caches `Package` by storage id and re-fetches on demand, but it has **no invalidation hook**, so a cached
 `MoveTypeLayout` for a dependent type survives a package upgrade. `birdai-resolve` adds:
 
-* cache key `(canonical StructTag, defining_package_version)`, not `StructTag` alone;
-* a `LayoutRegistry::on_package_published(ids)` callback driven by `effects.published_packages()` and by
-  `MovePackage` objects observed in the change set, which invalidates every cached layout whose canonical
-  tag's defining address is in the published/upgraded set — **transitively**, since pool A depends on three
-  packages (`pool`, `i32`, `skip_list`) and an upgrade to any of them changes the pool's instantiated
-  layout;
+* cache keyed by **canonical `StructTag`**, with every cached layout carrying the `(package, version)`
+  pairs it was resolved against; a read re-checks those versions and treats the entry as stale the
+  moment one moved;
+* a `LayoutRegistry::note_packages(versions)` hook driven by `MovePackage` objects observed in the
+  change set, which evicts every cached layout whose dependencies moved — **transitively**, since pool
+  A depends on three packages (`pool`, `i32`, `skip_list`) and an upgrade to any of them changes the
+  pool's instantiated layout. Invalidation is push-only: versions arrive through this hook, so a
+  poller that never feeds checkpoints must call it from its own observations;
 * a **fingerprint** (`blake3` over the compiled layout, including field names and tags) stored next to each
-  published state, so a checkpoint replay reproduces the exact layout that was live at that checkpoint.
+  published state, so tooling can assert a replay decoded with the exact layout that was live at that checkpoint
+  (the manager warns when a tracked venue's fingerprint changes under it).
 
 Typed states are built by **field name** (§5.3), so an appended or reordered field needs no code change;
 a renamed or removed field surfaces as `DecodeError::MissingField`, which is routed to an alert instead of
@@ -771,30 +787,38 @@ The boundary is exactly three things — **bytes, tag, version** — entering a 
 raw object (BCS bytes + StructTag + SequenceNumber + Owner)
    → LayoutSource::layout(tag)                       [layout, cached, upgrade-aware]
    → Venue::decode(bytes, layout, ctx)               [one pass, name-matched, no tree]
-   → Versioned<VenueState>                           [published atomically per checkpoint]
+   → VenueSlot                                       [published per object, watermarked per checkpoint]
 ```
 
 | | Checkpoint stream | Inside a validator |
 |---|---|---|
 | Raw objects | `sui_types::object::Object` from `Checkpoint::object_set` | the same type from the object store / `InputObjects` |
 | Version truth | Final and ordered; a checkpoint commits atomically | **Provisional**: state changes before consensus, so the manager needs `begin_tx / apply / commit_or_abort` with rollback on re-execution, and must not publish a checkpoint cursor until the effects are durable |
-| Layouts | `RpcPackageStore` over the network; async; evictable | straight out of the validator's `ModuleCache`; **synchronous**, and a package upgrade is visible the instant the publish executes |
+| Layouts | `SourcePackageStore` over gRPC; async; upgrade-aware cached | straight out of the validator's `ModuleCache`; **synchronous**, and a package upgrade is visible the instant the publish executes |
 | BCS provenance | From the wire; validated by the checkpoint digest | The very buffer the VM executed against — already trusted, so decode can skip validation and borrow directly, no copy |
 | Children | Must be re-associated by owner/effects | The VM hands over the child objects it loaded, so `ChildIndex` can be built from `InputObjects` directly |
 | Failure mode | Lag or a gap → resync from a checkpoint | Re-org or aborted execution → MVCC rollback |
 
-Concretely, switching source means: implement `RawObjectSource` for the validator's object store (the
-`sui-types` impl is already the same code), make `LayoutSource` synchronous behind the same trait (or keep
-`async` with a ready future), and add the two-phase commit to `StateManager`. **No venue, math, tick or
-decode code changes.** That is the payoff of putting the boundary at bytes+tag+version rather than at "an
-HTTP client".
+Concretely, switching source means: implement `ObjectSource` for the validator's object store
+(the gRPC impl is already the same shape), serve layouts from its `ModuleCache` behind the same
+`LayoutSource` trait (or keep `async` with a ready future), and add the two-phase commit to
+`StateManager`. **No venue, math, tick or decode code changes.** That is the payoff of putting
+the boundary at bytes+tag+version rather than at "an HTTP client".
 
-### 8.5 Ordering hazard worth calling out
+### 8.5 Ordering hazard, as implemented
 
-A checkpoint's `object_set` can contain several versions of the same object, and `effects.object_changes()`
-is per transaction. Applying changes in `Checkpoint::transactions` order and asserting
-`slot.version < new.version` catches both out-of-order application and the "same object mutated twice in
-one checkpoint" case; violating it is an error, not a silent last-writer-wins.
+A checkpoint's `object_set` can contain several versions of the same object, and
+`effects.object_changes()` is per transaction — the captured checkpoint mutates pool A twice.
+Two guards share the work:
+
+* checkpoints are deduplicated by sequence (`last_applied`): a checkpoint at or below the last
+  applied one is a duplicate delivery and skips whole, which is what makes re-applying safe;
+* versions are monotone per object (`should_publish`): an incoming version older than the slot's
+  is `OutOfOrder` — an error, not a silent last-writer-wins — while the same version is a no-op.
+
+The first catches retries; the second catches out-of-order application *and* the "same object
+mutated twice in one checkpoint" case. Both are pinned by tests that replay the captured
+checkpoint offline.
 
 ---
 
@@ -826,29 +850,28 @@ in, typed state out) and the **quality of the on-chain research** (§1) — incl
 
 ## 10. Testing
 
-* **Golden fixtures** — A, B, C, the tick child and checkpoint `320577815`'s relevant transactions:
-  bytes + layout + expected field dump with offsets. `cargo test` never touches the network.
-* **Reproduction as a test** — `assert_eq!(reproduce(pre_state, &tx)?, 81_168_759)`.
-* **Cross-check** — deep-diff our decode against the node's `contents { json }` (explicitly permitted) and
-  against `JsonVisitor::deserialize_value`.
+117 tests, all offline against the committed fixture set (`cargo test` never touches the network):
+
+* **Golden fixtures** — A, B, C, the tick children and checkpoint `320577815`'s kept transactions:
+  bytes + layout + expected field dump with offsets.
+* **Reproduction as a test** — `assert_eq!(quote, 81_168_759)` in `birdai-amm`, and the same number
+  asserted end to end by `reproduce --fixtures fixtures`.
+* **State replay as tests** — checkpoint 320 577 815 applies offline through `StateManager`: pool A
+  is tracked at its output version, re-applying is a no-op, and versions are monotone per object.
 * **Offset invariants** — for every leaf, `&bytes[start..position]` re-decoded standalone equals the leaf
-  value; `Cursor`-style skip and `Extractor` selection must agree on where every field ends.
-* **`proptest`** in `birdai-amm`:
-  * `mul_div_floor`/`mul_div_ceil` vs a `ruint::U512` reference (dev-dependency) and vs an `f64` oracle;
-  * `amount_out` strictly increasing in `amount_in`, strictly decreasing in `fee_rate`;
-  * round-trip: `swap(a→b)` then `swap(b→a)` never profits the trader, for random `L`, `S`, fee;
-  * tick loop terminates and conserves `L` at every boundary crossing;
-  * `CheckedU256` never wraps — for `L, S, amount` near the proven bounds the result is either exact or
-    `AmmError::Overflow`, never a wrong number.
-* **`proptest`** in `birdai-tick`: random tick sets, `Locate::Score` agrees with an exhaustive scan; the
-  skip-list walk never visits a node twice; `head`/`tail`/`size` are consistent.
-* **Boundary cases** — empty vector, `Option` present/absent, `OptionU64 { is_none: true }` with a stale
-  `v`, `L = 0`, `S = 0`, `u64::MAX` balances, single-element skip list, enum variant 0 and last.
-* **Classifier tests** — A passes all three probes; B fails (1)(2); C fails (1)(2)(3); plus a synthetic
-  package that has two `Balance` fields and no swap, which must **not** classify as a venue.
-* **Integration** — gRPC vs GraphQL dynamic-field pages for the tick inner UID, element for element.
-* `just format && just lint && just test && just mutation` (cargo-mutants), zero surviving mutants in
-  `birdai-amm` and `birdai-tick`.
+  value; `skip` paths keep parent spans valid under depth/item caps.
+* **`proptest`** in `birdai-amm`: round-trip `sqrt_price_at_tick`/`tick_at_sqrt_price` over the whole
+  grid; monotonicity sampled across it.
+* **Boundary cases** — empty vector, `OptionU64 { is_none: true }` with a stale `v` (payload kept),
+  missing `v` (hard `MissingField`), `L = 0`, `S = 0`, `u64::MAX` balances, single-element skip list,
+  ticks outside `[MIN_TICK, MAX_TICK]`, wrong-side price limits, stale boundaries, fee rates at and
+  above the denominator.
+* **Classifier tests** — the deny set (case, fragments, addresses), `referenced_types` descending into
+  enum variants, and the `is_endogenous` truth table (flow direction × price move × oracle veto).
+* **Tick index tests** — score/key consistency, duplicate and dangling links, backwards links
+  (`Unordered`), price-deviation buckets, bracketing and tie-breaking.
+* `just format && just lint && just test && just mutation` (cargo-mutants); mutation score is reported
+  in the README's Verification section.
 
 ---
 
@@ -858,29 +881,29 @@ No deadline. Each milestone is independently useful and leaves the repo green.
 
 **M0 — Skeleton and pins.** Workspace with the pinned git deps; `rust-toolchain.toml` 1.96.1;
 `just deps-check`; `ObjectSource`/`LayoutSource` traits with a gRPC implementation; fixture capture tool.
-*Exit:* `cargo run -- fetch --all` writes the three objects, their layouts and checkpoint 320577815 to
+*Exit:* `cargo run -- fetch --out fixtures` writes the three objects, their layouts and checkpoint 320577815 to
 `fixtures/`.
 
-**M1 — Decode.** `birdai-move`: `I32`/`I128`/`OptionU64`, `Dump` visitor, `MoveStruct` derive.
+**M1 — Decode.** `birdai-move`: `I32`/`I128`/`OptionU64`, `Dump` visitor, `StructDecoder` helpers.
 `birdai-tick`: skip-list indexing and `Locate`. Venue visitors for A/B/C.
-*Exit:* `decode --all` prints offset-annotated dumps; `check` deep-diffs against node JSON; gRPC/GraphQL
-dynamic-field cross-check passes.
+*Exit:* `decode` prints offset-annotated dumps; the committed fixtures pin the inner-UID round trip.
 
 **M2 — Classify.** `birdai-venue::Classifier` with the three probes, the oracle deny-set, and evidence
 rendering.
-*Exit:* `classify --all` prints per-probe evidence and the verdicts in §6.2.
+*Exit:* `classify` prints per-probe evidence and the verdicts in §6.2.
 
 **M3 — Recreate.** `birdai-amm`: `CheckedU256`, `tick_math` (`sqrt_price_at_tick`, exactly as
 `1.0001^(t/2)` with the bit-decomposition trick), `sqrt_price_math`, `swap_math`, and the multi-tick loop.
 *Exit:* `reproduce` prints L, S, tick range, the step, the output, and `Δ`; the golden test is 81 168 759;
 proptest suite green.
 
-**M4 — State.** `birdai-state`: `StateManager`, `ChildIndex`, `LayoutRegistry` with transitive
-invalidation, `Slot`/`ArcSwap` publication, two-phase commit hooks for the validator path.
-*Exit:* `follow --from 320577815 --to 320577900` tracks the pool live and prints tick-index delta; package
-upgrade invalidation covered by a synthetic test.
+**M4 — State.** `birdai-state`: `StateManager`, per-parent-bounded child index, `LayoutRegistry` with transitive
+invalidation, per-object `scc` slots with checkpoint watermarks and version-monotone publication.
+*Exit:* `follow --from 320577815 --count 5` tracks venues live and loads a new pool's ticks on first
+sight; package upgrade invalidation covered by a synthetic test; the captured checkpoint replays
+offline through the same `apply_checkpoint`.
 
-**M5 — Polish.** README (the graded §2/§3/§4 answers), `--offline` fixture mode, benches, `just ci` green,
+**M5 — Polish.** README (the graded §2/§3/§4 answers), `--fixtures DIR` replay mode, `just ci` green,
 mutation score reported.
 
 ---
@@ -890,12 +913,12 @@ mutation score reported.
 | Risk | Mitigation |
 |---|---|
 | Sui git dep build time / disk on a fresh clone | Pinned rev + `Cargo.lock` pinning; `kache` wrapper; `[profile.dev.package."*"] opt-level = 2`; README states the one-time network requirement |
-| Public fullnode gRPC / GraphQL rate limits during a demo | Fixtures + `--offline`; the state manager takes a `RawObjectSource`, so the demo can replay a checkpoint file |
+| Public fullnode gRPC / GraphQL rate limits during a demo | Fixtures + `--fixtures DIR`; every command runs unchanged against the capture, so the demo needs no node at all |
 | Public checkpoint object stores retain only ~30 days | Checkpoint `320577815` is fetched once and committed as a fixture |
 | Cetus package upgraded between research and grading | `calibrate` re-derives the fixed-point format from `S` and `tick`; typed decode is name-based; the layout cache is version-keyed |
 | `Resolver` limit defaults differ from the pool's nesting depth | Limits set explicitly and asserted; `Pool` is shallow (< 20 nodes) |
 | `PackageStoreWithLruCache` re-fetch semantics under `--offline` | Fixture store implements `PackageStore` directly, so the resolver path is exercised end-to-end offline |
-| Tick child not enumerated under `--offline` | All 654 tick nodes captured to fixtures at the relevant versions |
+| Tick child not enumerated under `--offline` | All 653 tick nodes captured to fixtures, plus the venue layouts of every pool the checkpoint touches |
 
 ---
 
@@ -944,11 +967,15 @@ plausible one.
 | 27 | §10 | Mutation testing is future work. | `cargo mutants -p birdai-amm -p birdai-tick` (248 mutants): 204 caught, 38 unviable, 6 missed — and the 6 split into 4 equivalent-by-construction plus 2 real gaps. The gaps were a self-linking skip-list node (it resolves in the score map, so only the `!= position` half of the resolvability check rejects it) and a negative price deviation whose magnitude needs a subtraction (division collapses every small negative deviation to −1). | Both gaps now have killer tests; a scoped re-run over `birdai-tick/src/index.rs` reports 103 caught, 33 unviable, **0 missed**. The 4 equivalents (`delta_a`/`delta_b` `||`→`&&`, min-clamp `<`→`==`/`<=`) are pinned by in-code comments plus tests that lock the equivalence. Effective kill rate on killable mutants: 100%. |
 | 28 | §8.3 | A tick snapshot read over RPC is consistent. | It is not, on a live pool: listing the children is paginated and fetching them is a later round trip, so a tick added or removed in between leaves a snapshot whose link graph does not close. Online `reproduce` failed with `node 515776 links to 515836, which is not in the index` — the pool had grown new ticks since the fixtures were captured. Retrying the fetch alone cannot help, because the inconsistency is in the *listing*, not the fetch. | `load_tick_index` re-takes the whole snapshot once on any validation failure and only then fails loudly. Observed live: the retry fired (`node 508836 links to 508866`), the second snapshot validated, and the quote still matched the chain exactly. |
 | 29 | §2.2 | `just lint` passes as written. | It did not, for three reasons, all outside our code: (a) `allocative <= 0.3.5` fails on recent nightlies (duplicate `Allocative` impls for `!` vs `Infallible`, E0119), which reds the nightly-clippy step and CI with it; (b) `cargo workspace-inheritance-check --check` was never a valid flag — the tool checks by default; (c) 23 declared dependencies were dead (template leftovers like `config`/`rustls`, and refs removed by refactors such as `sui-rpc-resolver` after item 22). | (a) `third-party/allocative`: vendored 0.3.4 with exactly the redundant `!` impl deleted (stable never compiled it, so behaviour is unchanged there) plus warning fixes, wired via `[patch.crates-io]` kept last in the root manifest — a `[patch.*]` header ends the preceding table, so it must never be spliced into `[workspace.dependencies]`. (b) The Justfile recipe now calls the tool bare. (c) All 23 removed after grep-verifying zero uses; `cargo shear` is clean. |
+| 30 | §8.2 | One bad object fails the checkpoint, and re-applying is free. | Neither held. Replaying the captured checkpoint offline showed a second Cetus deployment (`0x91bfbc38…::pool::Pool` with three type parameters) whose package the capture predates — layout resolution failed and aborted the whole apply — and the same checkpoint mutates pool A twice, so a naive re-apply walks versions backwards. | Per-tag resolution failures skip their objects with a counted failure; checkpoints deduplicate by sequence (`last_applied`) and versions stay monotone per object (`should_publish`, with same-version re-apply a no-op). Both arms are pinned by offline replay tests. |
+| 31 | §7.2 | Any `price_limit` is a valid bound. | A limit behind the price walked the price backwards through `next_price`, and a stale tick source could do the same through a boundary — while `UnreachablePriceLimit` sat unconstructed. `take_fee` also misused `DivByZero` for an invalid fee rate. | Up-front validation rejects a wrong-side limit and ignores a behind-price boundary (`is_ahead`); `take_fee` returns `InvalidFeeRate`. Each side has a test, including the stale-boundary quote matching the boundary-free one. |
+| 32 | §5.3 | Decoders fail closed. | Two did not: `VecVisitor` pre-allocated from the untrusted BCS length prefix, and `OptionU64Decoder` defaulted a missing `v` to `0` — a `Some(0)` out of thin air on a pricing path. The visitor error conversion also discarded its source. | The reservation is capped (`MAX_VECTOR_PREALLOC`); a missing `v` is `MissingField`; the conversion keeps the message (`Annotation`). The `is_cetus_skip_list` module/name wildcard stays, but is now documented as a labelling hint with the upgrade trade-off stated. |
+| 33 | §8.3, §11 | `fetch` captures what the commands decoded; `follow` tracks venues. | `fetch` never decoded the checkpoint's *other* venues, so their packages were missing offline; `follow` tracked new pools without ticks, so they could never be quoted (`install_ticks` had no caller). | `fetch` pre-resolves every venue-shaped object the recorded checkpoint carries; `follow` loads a new Cetus pool's ticks on first sight. The state manager itself only indexes children of tracked pools' inner UIDs, with per-parent caps whose drops are counted and warned. |
 
 ### Offline replay
 
 §2.2's "fixtures are designed but not committed" is closed: `cargo run -- fetch --out fixtures`
-captures 912 KB — pool A at three versions, B, C, 650 tick nodes, 8 packages, 4 layouts, and a
+captures 1.2 MB — pool A at three versions, B, C, 653 tick nodes, 12 packages, 9 layouts, and a
 filtered checkpoint — and `cargo run -- --fixtures fixtures <command>` replays any of them offline.
 The design constraint that made this cheap is that `ObjectSource` and `LayoutSource` were traits from
 the start: switching to `FixtureObjectSource`/`FixtureLayoutSource` changed one constructor, and every

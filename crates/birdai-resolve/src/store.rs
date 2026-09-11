@@ -45,7 +45,18 @@ impl<O: ObjectSource + 'static> PackageStore for SourcePackageStore<O> {
             .await
             .map_err(|error: ResolveError| {
                 tracing::debug!(package = %id.to_canonical_string(true), %error, "package fetch failed");
-                sui_package_resolver::error::Error::PackageNotFound(id)
+                // "Not found" means the package is gone; anything else is a transport failure
+                // the resolver must be able to tell apart from a missing package, so it keeps
+                // the message instead of collapsing both into `PackageNotFound`.
+                match error {
+                    ResolveError::ObjectNotFound { .. } => {
+                        sui_package_resolver::error::Error::PackageNotFound(id)
+                    }
+                    other => sui_package_resolver::error::Error::Store {
+                        store: "SourcePackageStore",
+                        error: other.to_string(),
+                    },
+                }
             })?;
         Ok(Arc::new(Package::read_from_object(&object)?))
     }

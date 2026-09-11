@@ -5,7 +5,9 @@
 //! * [`sui_package_resolver::Resolver`] turns a `TypeTag` into an annotated
 //!   [`move_core_types::annotated_value::MoveTypeLayout`] by reading real on-chain package
 //!   bytecode, and canonicalises every struct tag to its defining package;
-//! * [`sui_rpc_resolver::package_store::RpcPackageStore`] is a `PackageStore` backed by a fullnode;
+//! * [`store::SourcePackageStore`] is a `PackageStore` over any [`ObjectSource`], so the same
+//!   source serves objects and package bytecode — including fixtures and a validator's object
+//!   store, which a URL-bound store could never do;
 //! * [`sui_rpc_api::Client`] fetches objects, checkpoints and dynamic fields as native Sui types.
 //!
 //! What is added here is the piece none of them cover: **layout invalidation on package upgrade**.

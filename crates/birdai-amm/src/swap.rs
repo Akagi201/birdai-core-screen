@@ -21,9 +21,10 @@ pub const FEE_DENOMINATOR: u64 = 1_000_000;
 /// Split a gross input into the amount that participates in the swap and the fee taken from it.
 ///
 /// The fee is rounded **down**, matching the pool. Returns the net input first.
+#[inline]
 pub fn take_fee(amount_in: u128, fee_rate: u64) -> Result<(u128, u128), AmmError> {
     if fee_rate >= FEE_DENOMINATOR {
-        return Err(AmmError::DivByZero { op: "fee rate must be below the denominator" });
+        return Err(AmmError::InvalidFeeRate { rate: fee_rate });
     }
     let fee = CheckedU256::from_u128(amount_in)
         .checked_mul(CheckedU256::from_u64(fee_rate))?
@@ -37,6 +38,7 @@ pub fn take_fee(amount_in: u128, fee_rate: u64) -> Result<(u128, u128), AmmError
 ///
 /// Rounded down by default and up when `round_up`, exactly as the pool does when it computes what
 /// it is owed versus what it pays out.
+#[inline]
 pub fn delta_a(
     sqrt_a: u128,
     sqrt_b: u128,
@@ -68,6 +70,7 @@ pub fn delta_a(
 
 /// `Δb = L · (√P_hi − √P_lo) / 2^64`, the amount of token B held by liquidity `L` between two
 /// prices.
+#[inline]
 pub fn delta_b(
     sqrt_a: u128,
     sqrt_b: u128,
@@ -90,6 +93,7 @@ pub fn delta_b(
 /// The square-root price reached after selling `amount_b` of token B (price moving up).
 ///
 /// Rounded **down**, so the price target never overshoots what the input can pay for.
+#[inline]
 pub fn next_sqrt_price_up(
     sqrt_price: u128,
     liquidity: u128,
@@ -111,6 +115,7 @@ pub fn next_sqrt_price_up(
 /// exact form of the pool's `⌈L·√P / (L + amount·√P/2^64)⌉`; because the intermediates are computed
 /// in 256 bits there is no need for the overflow fallback the 256-bit reference implementation
 /// carries.
+#[inline]
 pub fn next_sqrt_price_down(
     sqrt_price: u128,
     liquidity: u128,
@@ -176,7 +181,8 @@ pub struct Step {
     pub sqrt_price_end: u128,
     /// Active liquidity used by the step.
     pub liquidity: u128,
-    /// True when the step finished on a tick boundary rather than on the input running out.
+    /// True when the step reached its price target — a tick boundary or the swap's price
+    /// limit — rather than running out of input.
     pub crossed: bool,
 }
 
@@ -195,7 +201,11 @@ pub struct SwapResult {
     pub sqrt_price_end: u128,
     /// Current tick before the swap.
     pub tick_start: i32,
-    /// Current tick after the swap.
+    /// The last initialised tick crossed, or the starting tick when none was crossed.
+    ///
+    /// This is *not* `tick_at_sqrt_price(sqrt_price_end)`: the end price cannot be mapped back
+    /// through the approximate tick math without risking an off-by-one against the stored
+    /// per-tick prices, so the swap reports where its boundaries took it instead.
     pub tick_end: i32,
     /// Active liquidity before the swap.
     pub liquidity_start: u128,
@@ -216,6 +226,7 @@ impl SwapResult {
 }
 
 /// Price the input of an exact-in step would reach, whether it crosses the limit or not.
+#[inline]
 fn next_price(
     direction: Direction,
     sqrt_price: u128,
@@ -269,6 +280,22 @@ pub fn swap_exact_in(
     max_crossings: u32,
 ) -> Result<SwapResult, AmmError> {
     let PoolState { sqrt_price, liquidity, tick, fee_rate } = state;
+    // Reject degenerate state and an unreachable limit up front, so the loop below never has to
+    // interpret them: a zero price or zero liquidity cannot be stepped from, and a limit behind
+    // the price would otherwise walk the price backwards through `next_price`.
+    if sqrt_price == 0 {
+        return Err(AmmError::InvalidSqrtPrice(0));
+    }
+    if liquidity == 0 {
+        return Err(AmmError::ZeroLiquidity);
+    }
+    let limit_reachable = match direction {
+        Direction::BtoA => price_limit >= sqrt_price,
+        Direction::AtoB => price_limit <= sqrt_price,
+    };
+    if !limit_reachable {
+        return Err(AmmError::UnreachablePriceLimit { current: sqrt_price, limit: price_limit });
+    }
     let (net_input, fee) = take_fee(amount_in, fee_rate)?;
     let sqrt_price_start = sqrt_price;
     let liquidity_start = liquidity;
@@ -291,8 +318,11 @@ pub fn swap_exact_in(
         let boundary = match direction {
             Direction::BtoA => source.next_boundary_up(tick),
             Direction::AtoB => source.next_boundary_down(tick),
-        };
-        let limit = boundary.map_or(price_limit, |b| b.sqrt_price);
+            // A stale source can hand back a boundary behind the price; stepping to it would
+            // move the price backwards, so it is ignored rather than trusted.
+        }
+        .filter(|boundary| is_ahead(direction, boundary.sqrt_price, sqrt_price));
+        let limit = boundary.map_or(price_limit, |boundary| boundary.sqrt_price);
 
         let (next, reached_limit) = next_price(direction, sqrt_price, liquidity, remaining, limit)?;
         if next == sqrt_price {
@@ -367,6 +397,7 @@ pub fn swap_exact_in(
 }
 
 /// Apply the signed liquidity change of a tick boundary.
+#[inline]
 pub fn apply_liquidity_change(liquidity: u128, liquidity_net: i128) -> Result<u128, AmmError> {
     if liquidity_net >= 0 {
         liquidity
@@ -376,6 +407,14 @@ pub fn apply_liquidity_change(liquidity: u128, liquidity_net: i128) -> Result<u1
         liquidity
             .checked_sub(liquidity_net.unsigned_abs())
             .ok_or(AmmError::Overflow { op: "subtract liquidity net" })
+    }
+}
+
+/// True when a boundary lies strictly ahead of the price in the direction of travel.
+const fn is_ahead(direction: Direction, boundary_price: u128, sqrt_price: u128) -> bool {
+    match direction {
+        Direction::BtoA => boundary_price > sqrt_price,
+        Direction::AtoB => boundary_price < sqrt_price,
     }
 }
 
@@ -555,7 +594,90 @@ mod tests {
 
     #[test]
     fn rejects_a_fee_rate_at_or_above_the_denominator() {
-        assert!(take_fee(1_000, 1_000_000).is_err());
+        assert!(matches!(
+            take_fee(1_000, 1_000_000),
+            Err(AmmError::InvalidFeeRate { rate: 1_000_000 })
+        ));
+        assert!(matches!(
+            take_fee(1_000, 1_000_001),
+            Err(AmmError::InvalidFeeRate { rate: 1_000_001 })
+        ));
+    }
+
+    #[test]
+    fn zero_input_takes_no_fee() -> Result<(), AmmError> {
+        assert_eq!(take_fee(0, T_FEE_RATE)?, (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_price_limit_behind_the_price_is_rejected() {
+        // Selling B must raise the price: a limit below it is unreachable, in either the `==`
+        // sense (handled by the loop) or the strict sense (handled up front).
+        let outcome = swap_exact_in(
+            &SingleBoundary,
+            Direction::BtoA,
+            T_STATE,
+            T_AMOUNT_IN,
+            T_SQRT_PRICE - 1,
+            8,
+        );
+        assert!(matches!(
+            outcome,
+            Err(AmmError::UnreachablePriceLimit { current: T_SQRT_PRICE, limit })
+            if limit == T_SQRT_PRICE - 1
+        ));
+        let outcome =
+            swap_exact_in(&EmptySource, Direction::AtoB, T_STATE, 1_000, T_SQRT_PRICE + 1, 8);
+        assert!(matches!(outcome, Err(AmmError::UnreachablePriceLimit { .. })));
+    }
+
+    #[test]
+    fn a_boundary_behind_the_price_is_ignored() -> Result<(), AmmError> {
+        // A stale source reporting a tick below the price must not drag the swap backwards: the
+        // boundary is skipped and the quote matches the boundary-free one.
+        struct Stale;
+        impl TickSource for Stale {
+            fn next_boundary_up(&self, _tick: i32) -> Option<Boundary> {
+                Some(Boundary { tick: 0, sqrt_price: T_SQRT_PRICE - 1_000, liquidity_net: 0 })
+            }
+            fn next_boundary_down(&self, _tick: i32) -> Option<Boundary> {
+                None
+            }
+        }
+        let stale =
+            swap_exact_in(&Stale, Direction::BtoA, T_STATE, T_AMOUNT_IN, MAX_SQRT_PRICE, 8)?;
+        let clean =
+            swap_exact_in(&EmptySource, Direction::BtoA, T_STATE, T_AMOUNT_IN, MAX_SQRT_PRICE, 8)?;
+        assert_eq!(stale.amount_out, clean.amount_out);
+        assert_eq!(stale.amount_out, T_AMOUNT_OUT);
+        Ok(())
+    }
+
+    #[test]
+    fn degenerate_starting_state_is_rejected_up_front() {
+        assert!(matches!(
+            swap_exact_in(
+                &EmptySource,
+                Direction::BtoA,
+                PoolState { sqrt_price: 0, ..T_STATE },
+                1_000,
+                MAX_SQRT_PRICE,
+                8
+            ),
+            Err(AmmError::InvalidSqrtPrice(0))
+        ));
+        assert!(matches!(
+            swap_exact_in(
+                &EmptySource,
+                Direction::BtoA,
+                PoolState { liquidity: 0, ..T_STATE },
+                1_000,
+                MAX_SQRT_PRICE,
+                8
+            ),
+            Err(AmmError::ZeroLiquidity)
+        ));
     }
 
     #[test]

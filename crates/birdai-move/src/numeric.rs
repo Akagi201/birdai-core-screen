@@ -208,7 +208,10 @@ impl<'b, 'l> StructDecoder<'b, 'l> for OptionU64Decoder {
         }
         Ok(OptionU64 {
             is_none: is_none.ok_or(DecodeError::MissingField("is_none"))?,
-            value: value.unwrap_or(0),
+            // A missing payload is a missing field, not a zero: `Some(0)` out of thin air on a
+            // pricing path would be a silent wrong answer, and the fail-closed direction is to
+            // reject the node.
+            value: value.ok_or(DecodeError::MissingField("v"))?,
         })
     }
 }
@@ -242,5 +245,53 @@ mod tests {
         let stale = OptionU64 { is_none: true, value: 42 };
         assert_eq!(stale.to_option(), None);
         assert_eq!(OptionU64 { is_none: false, value: 42 }.to_option(), Some(42));
+    }
+
+    #[test]
+    fn option_u64_decodes_against_a_real_layout() -> Result<(), crate::error::DecodeError> {
+        use move_core_types::{
+            account_address::AccountAddress,
+            annotated_value::{MoveFieldLayout, MoveStructLayout, MoveTypeLayout},
+            identifier::Identifier,
+            language_storage::StructTag,
+        };
+
+        use super::OptionU64Decoder;
+        use crate::{error::DecodeError, visitor::decode_struct};
+
+        // Test-only identifiers are valid Move identifiers by construction.
+        fn ident(text: &str) -> Identifier {
+            Identifier::new(text).unwrap_or_else(|_| unreachable!())
+        }
+
+        fn layout(fields: Vec<(&str, MoveTypeLayout)>) -> MoveStructLayout {
+            MoveStructLayout {
+                type_: StructTag {
+                    address: AccountAddress::TWO,
+                    module: ident("option_u64"),
+                    name: ident("OptionU64"),
+                    type_params: vec![],
+                },
+                fields: fields
+                    .into_iter()
+                    .map(|(name, layout)| MoveFieldLayout { name: ident(name), layout })
+                    .collect(),
+            }
+        }
+
+        let full = layout(vec![("is_none", MoveTypeLayout::Bool), ("v", MoveTypeLayout::U64)]);
+        // `is_none = false`, `v = 515_646` (`0x07DE3E`, little-endian below).
+        let bytes = [0x00, 0x3e, 0xde, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let decoded = decode_struct(&bytes, &full, OptionU64Decoder)?;
+        assert_eq!(decoded.to_option(), Some(515_646));
+
+        // A layout without `v` — an older or foreign `OptionU64` — is a missing field, not a
+        // zero. `Some(0)` out of thin air on a pricing path would be a silent wrong answer.
+        let without_payload = layout(vec![("is_none", MoveTypeLayout::Bool)]);
+        assert!(matches!(
+            decode_struct(&[0x00], &without_payload, OptionU64Decoder),
+            Err(DecodeError::MissingField("v"))
+        ));
+        Ok(())
     }
 }

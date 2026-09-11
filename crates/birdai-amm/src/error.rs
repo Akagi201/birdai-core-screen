@@ -27,6 +27,13 @@ pub enum AmmError {
         op: &'static str,
     },
 
+    /// The pool's fee rate is not below its denominator, so no fee can be computed from it.
+    #[error("fee rate {rate} is not below the denominator")]
+    InvalidFeeRate {
+        /// The offending fee rate.
+        rate: u64,
+    },
+
     /// The pool has no active liquidity, so no trade can be priced.
     #[error("pool has zero active liquidity")]
     ZeroLiquidity,

@@ -1,6 +1,6 @@
 //! Decoding and indexing of the pool's tick skip list.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use birdai_amm::{Boundary, TickSource, sqrt_price_at_tick};
 use birdai_move::{
@@ -17,14 +17,36 @@ pub const CETUS_TICK_BIAS: i32 = 443_636;
 
 /// The skip-list key for a tick index: `tick + MAX_TICK`.
 #[must_use]
+#[inline]
 pub const fn score_from_tick(tick: i32) -> u64 {
+    // Every tick the pool can represent satisfies `tick + BIAS >= 0`, so in practice this is
+    // exact; the checked twin below is what fallible paths use.
     (tick + CETUS_TICK_BIAS) as u64
 }
 
 /// The tick index behind a skip-list key.
 #[must_use]
+#[inline]
 pub const fn tick_from_score(score: u64) -> i32 {
     score as i32 - CETUS_TICK_BIAS
+}
+
+/// Fallible [`score_from_tick`]: `None` when the tick is outside the bias's encoding range.
+#[must_use]
+pub const fn checked_score_from_tick(tick: i32) -> Option<u64> {
+    match tick.checked_add(CETUS_TICK_BIAS) {
+        Some(biased) if biased >= 0 => Some(biased as u64),
+        _ => None,
+    }
+}
+
+/// Fallible [`tick_from_score`]: `None` when the score does not round-trip the bias.
+#[must_use]
+pub const fn checked_tick_from_score(score: u64) -> Option<i32> {
+    if score > i32::MAX as u64 {
+        return None;
+    }
+    (score as i32).checked_sub(CETUS_TICK_BIAS)
 }
 
 /// The UID that owns the tick nodes, extracted from `tick_manager.ticks.id`.
@@ -72,6 +94,7 @@ pub struct TickNode {
 impl TickNode {
     /// The tick index.
     #[must_use]
+    #[inline]
     pub const fn index(&self) -> i32 {
         self.tick.index.get()
     }
@@ -99,6 +122,7 @@ pub struct SkipListHead {
 impl SkipListHead {
     /// The UID the nodes hang off, as an [`ObjectID`].
     #[must_use]
+    #[inline]
     pub const fn node_uid(&self) -> ObjectID {
         self.node_uid
     }
@@ -124,7 +148,10 @@ impl SizeSkew {
     /// written.
     #[must_use]
     pub const fn delta(self) -> i64 {
-        self.observed as i64 - self.declared as i64
+        // Both counts are small in practice; the saturating path only exists so a corrupt
+        // metadata count cannot wrap the sign.
+        self.observed.saturating_sub(self.declared) as i64 -
+            self.declared.saturating_sub(self.observed) as i64
     }
 }
 
@@ -139,13 +166,19 @@ pub enum Locate {
 
 /// A pool's tick index: every initialised tick, ordered and validated.
 ///
-/// Built from decoded nodes plus the skip list metadata. Construction enforces the two invariants
+/// Built from decoded nodes plus the skip list metadata. Construction enforces the invariants
 /// that matter for pricing:
 ///
-/// * the level-0 chain visits every node exactly once and is ordered by tick index — this is the
-///   check that catches a partial or duplicated page walk, and
-/// * every node's stored `sqrt_price` equals [`sqrt_price_at_tick`] of its index — this is the
-///   check that catches a wrong tick math or a misread node.
+/// * every node's key equals `score_from_tick` of its index — this is the check that catches a
+///   misread node or a walk that mixed up two ticks;
+/// * every level-0 link resolves to a *different* node that is present and ahead of it — this is
+///   the check that catches a partial page walk, a concurrent tick removal, or a backwards link;
+/// * every node's stored `sqrt_price` is within tolerance of [`sqrt_price_at_tick`] of its index —
+///   this is the check that catches wrong tick math.
+///
+/// Neighbour lookup itself does not walk the links: it ranges over the tick-ordered map, so a
+/// bad link can fail validation but can never steer a quote — pricing follows the ordered index,
+/// not the chain.
 #[derive(Debug, Clone, Default)]
 pub struct Ticks {
     /// The UID the nodes were read from.
@@ -155,7 +188,7 @@ pub struct Ticks {
     /// Tick index to position in `nodes`.
     by_tick: BTreeMap<i32, usize>,
     /// Skip-list key to position in `nodes`.
-    by_score: HashMap<u64, usize>,
+    by_score: BTreeMap<u64, usize>,
     /// The count the skip-list metadata declares. When `strict_size` is set, a mismatch is an
     /// error.
     declared_size: Option<u64>,
@@ -180,7 +213,7 @@ impl Ticks {
             node_uid,
             nodes: Vec::new(),
             by_tick: BTreeMap::new(),
-            by_score: HashMap::new(),
+            by_score: BTreeMap::new(),
             declared_size,
             strict_size: true,
             price_deviations: BTreeMap::new(),
@@ -203,7 +236,7 @@ impl Ticks {
             node_uid,
             nodes: Vec::new(),
             by_tick: BTreeMap::new(),
-            by_score: HashMap::new(),
+            by_score: BTreeMap::new(),
             declared_size: Some(declared_size),
             strict_size: false,
             price_deviations: BTreeMap::new(),
@@ -224,12 +257,14 @@ impl Ticks {
 
     /// The count the skip-list metadata declared, if one was supplied.
     #[must_use]
+    #[inline]
     pub const fn declared_size(&self) -> Option<u64> {
         self.declared_size
     }
 
     /// True when the node count is known to match the declared size.
     #[must_use]
+    #[inline]
     pub const fn is_complete(&self) -> bool {
         match self.declared_size {
             Some(declared) => declared == self.nodes.len() as u64,
@@ -238,10 +273,22 @@ impl Ticks {
     }
 
     /// Add one node.
+    ///
+    /// The node's key must encode its index, and neither the key nor the index may already be
+    /// present: a walk that mixed up two ticks, or repeated one, is corrupt input rather than a
+    /// second opinion. The node is appended unsorted; [`Ticks::validate`] restores tick order,
+    /// so validate before reading after inserting.
     pub fn insert(&mut self, node: TickNode) -> Result<(), TickError> {
+        let expected = checked_score_from_tick(node.index())
+            .ok_or_else(|| TickError::TickOutOfRange(node.index()))?;
+        if node.score != expected {
+            return Err(TickError::ScoreMismatch { tick: node.index(), score: node.score });
+        }
         if self.by_score.contains_key(&node.score) {
             return Err(TickError::DuplicateNode(node.score));
         }
+        // No separate duplicate-tick check: the key is a pure function of the index, so a
+        // repeated tick always repeats its key and trips the check above.
         let position = self.nodes.len();
         self.by_score.insert(node.score, position);
         self.by_tick.insert(node.index(), position);
@@ -270,13 +317,18 @@ impl Ticks {
 
         for (position, node) in self.nodes.iter().enumerate() {
             if let Some(next) = node.nexts.first() {
-                // A forward link must resolve to a *different* node that is present. Pointing at
-                // itself, or at a node that was not decoded, means the walk is broken.
-                let resolvable = self
-                    .by_score
-                    .get(next)
-                    .is_some_and(|position_of_next| *position_of_next != position);
-                if !resolvable {
+                // A forward link must resolve to a *different* node that is present, and ahead
+                // of this one: the level-0 chain is tick-ordered, so a link backwards or to
+                // itself means the walk is broken. Pointing at a node that was not decoded
+                // means the snapshot did not close.
+                let next_position = self.by_score.get(next).copied();
+                let ahead = next_position.is_some_and(|next| {
+                    next != position && self.nodes[next].index() > node.index()
+                });
+                if !ahead {
+                    if next_position.is_some_and(|next| next != position) {
+                        return Err(TickError::Unordered);
+                    }
                     return Err(TickError::DanglingLink { score: node.score, neighbour: *next });
                 }
             }
@@ -313,36 +365,42 @@ impl Ticks {
     /// ticks land on `0` and a minority on `-1`; the distribution is exposed so the claim is
     /// measured rather than asserted.
     #[must_use]
+    #[inline]
     pub const fn price_deviations(&self) -> &BTreeMap<i128, usize> {
         &self.price_deviations
     }
 
     /// The largest absolute deviation of any node's stored price from the tick math.
     #[must_use]
+    #[inline]
     pub fn max_price_deviation(&self) -> u128 {
         self.price_deviations.keys().map(|deviation| deviation.unsigned_abs()).max().unwrap_or(0)
     }
 
     /// How many nodes store exactly the price the tick math derives.
     #[must_use]
+    #[inline]
     pub fn exact_price_nodes(&self) -> usize {
         self.price_deviations.get(&0).copied().unwrap_or(0)
     }
 
     /// Number of initialised ticks.
     #[must_use]
+    #[inline]
     pub const fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// True when the pool has no initialised ticks.
     #[must_use]
+    #[inline]
     pub const fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
     /// The UID the nodes live under.
     #[must_use]
+    #[inline]
     pub const fn node_uid(&self) -> Option<ObjectID> {
         self.node_uid
     }
@@ -367,12 +425,14 @@ impl Ticks {
 
     /// Look up a tick exactly.
     #[must_use]
+    #[inline]
     pub fn get(&self, tick: i32) -> Option<&TickNode> {
         self.by_tick.get(&tick).and_then(|&position| self.nodes.get(position))
     }
 
     /// The nearest initialised tick to `tick`, preferring the lower one on a tie.
     #[must_use]
+    #[inline]
     pub fn nearest(&self, tick: i32) -> Option<&TickNode> {
         let upper = self.next_above(tick);
         let lower = self.next_at_or_below(tick);
@@ -391,8 +451,26 @@ impl Ticks {
         }
     }
 
+    /// Check every initialised tick against the pool's spacing grid.
+    ///
+    /// Ticks initialise only on multiples of `tick_spacing`, so an off-grid node was misread or
+    /// does not belong to this pool. A zero spacing accepts everything, so a pool that reports
+    /// none cannot fail this check.
+    pub fn validate_spacing(&self, spacing: u32) -> Result<(), TickError> {
+        if spacing == 0 {
+            return Ok(());
+        }
+        for node in &self.nodes {
+            if (i64::from(node.index())).rem_euclid(i64::from(spacing)) != 0 {
+                return Err(TickError::OffGrid { tick: node.index(), spacing });
+            }
+        }
+        Ok(())
+    }
+
     /// The smallest initialised tick strictly above `tick`.
     #[must_use]
+    #[inline]
     pub fn next_above(&self, tick: i32) -> Option<&TickNode> {
         self.by_tick
             .range((std::ops::Bound::Excluded(tick), std::ops::Bound::Unbounded))
@@ -402,6 +480,7 @@ impl Ticks {
 
     /// The largest initialised tick at or below `tick`.
     #[must_use]
+    #[inline]
     pub fn next_at_or_below(&self, tick: i32) -> Option<&TickNode> {
         self.by_tick
             .range((std::ops::Bound::Unbounded, std::ops::Bound::Included(tick)))
@@ -411,6 +490,7 @@ impl Ticks {
 
     /// The largest initialised tick strictly below `tick`.
     #[must_use]
+    #[inline]
     pub fn next_below(&self, tick: i32) -> Option<&TickNode> {
         self.by_tick
             .range((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(tick)))
@@ -420,6 +500,7 @@ impl Ticks {
 
     /// Resolve a [`Locate`] request.
     #[must_use]
+    #[inline]
     pub fn locate(&self, locate: Locate) -> Option<&TickNode> {
         match locate {
             Locate::Exact(tick) => self.get(tick),
@@ -429,12 +510,14 @@ impl Ticks {
 
     /// The initialised ticks that bracket `tick`, if the pool has them.
     #[must_use]
+    #[inline]
     pub fn bracketing(&self, tick: i32) -> (Option<&TickNode>, Option<&TickNode>) {
         (self.next_at_or_below(tick), self.next_above(tick))
     }
 
     /// The active liquidity change when crossing `tick` upwards.
     #[must_use]
+    #[inline]
     pub fn liquidity_net_at(&self, tick: i32) -> Option<i128> {
         self.get(tick).map(|node| node.tick.liquidity_net.get())
     }
@@ -879,6 +962,46 @@ mod tests {
     }
 
     #[test]
+    fn checked_conversions_reject_what_does_not_round_trip() {
+        use super::{checked_score_from_tick, checked_tick_from_score};
+        assert_eq!(checked_score_from_tick(71_060), Some(514_696));
+        assert_eq!(checked_tick_from_score(514_696), Some(71_060));
+        assert_eq!(checked_tick_from_score(0), Some(-CETUS_TICK_BIAS));
+        assert_eq!(checked_score_from_tick(i32::MAX), None);
+        assert_eq!(checked_tick_from_score(i32::MAX as u64 + 1), None);
+    }
+
+    #[test]
+    fn rejects_a_node_whose_key_does_not_encode_its_index() {
+        let mismatched = node(514_696, 71_050, 643_685_510_299_636_945_792, 0);
+        let outcome = Ticks::new(None, None, [mismatched]);
+        assert!(matches!(
+            outcome,
+            Err(super::TickError::ScoreMismatch { tick: 71_050, score: 514_696 })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_forward_link_pointing_backwards() {
+        let mut first = node(514_686, 71_050, 643_685_510_299_636_945_792, 0);
+        let mut second = node(514_696, 71_060, 644_007_417_429_774_971_181, 0);
+        first.nexts = vec![514_696];
+        second.nexts = vec![514_686];
+        let outcome = Ticks::new(None, None, [first, second]);
+        assert!(matches!(outcome, Err(super::TickError::Unordered)));
+    }
+
+    #[test]
+    fn spacing_checks_the_grid_not_the_values() -> Result<(), super::TickError> {
+        let index = mainnet_index()?;
+        index.validate_spacing(10)?;
+        assert!(matches!(index.validate_spacing(7), Err(super::TickError::OffGrid { .. })));
+        // A pool that reports no spacing cannot fail the check.
+        index.validate_spacing(0)?;
+        Ok(())
+    }
+
+    #[test]
     fn rejects_a_dangling_forward_link() {
         let mut first = node(514_686, 71_050, 643_685_510_299_636_945_792, 0);
         first.nexts = vec![123_456_789];
@@ -976,7 +1099,8 @@ mod tests {
         assert_eq!(index.liquidity_net_at(71_180), Some(212_759_778_363));
         assert_eq!(index.liquidity_net_at(71_180), Some(212_759_778_363));
         // A negative net, as seen when a range's upper tick is crossed upwards.
-        let negative = node(1, 100, birdai_amm::sqrt_price_at_tick(100)?, -5);
+        let negative =
+            node(super::score_from_tick(100), 100, birdai_amm::sqrt_price_at_tick(100)?, -5);
         let index = Ticks::new(None, None, [negative])?;
         assert_eq!(index.liquidity_net_at(100), Some(-5));
         Ok(())

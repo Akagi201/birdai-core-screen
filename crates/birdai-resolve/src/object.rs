@@ -291,23 +291,61 @@ impl ObjectSource for GrpcObjectSource {
         // 650-odd tick nodes and then fetching them takes long enough that a tick can be removed in
         // between. So a batch failure is retried object by object, skipping anything that is gone.
         match self.client.batch_get_objects(ids).await {
-            Ok(objects) => Ok(objects),
+            Ok(objects) if objects.len() == ids.len() => Ok(objects),
+            Ok(objects) => {
+                // A partial `Ok` is the same hazard in a quieter form: the caller asked for
+                // specific ids, so silently returning fewer would misattribute every object
+                // after the gap. Fall back to the reconciling path.
+                tracing::debug!(
+                    requested = ids.len(),
+                    returned = objects.len(),
+                    "batch returned fewer objects than requested; refetching individually"
+                );
+                self.objects_individually(ids).await
+            }
             Err(_) => self.objects_individually(ids).await,
         }
     }
 }
 
 impl GrpcObjectSource {
+    /// How many single-object fetches to run at once in the fallback path.
+    ///
+    /// The fallback only runs when the batch failed, which is exactly when the pool is churning;
+    /// sequential refetches would turn 650 tick nodes into hundreds of serial round trips.
+    const FETCH_CONCURRENCY: usize = 32;
+
     async fn objects_individually(&self, ids: &[ObjectID]) -> Result<Vec<Object>, ResolveError> {
+        use tokio::task::JoinSet;
+
         let mut objects = Vec::with_capacity(ids.len());
-        for id in ids {
-            match self.client.clone().get_object(*id).await {
-                Ok(object) => objects.push(object),
-                Err(status) if status.code() == Code::NotFound => {
-                    tracing::debug!(object = %id.to_canonical_string(true), "object vanished before it could be fetched");
-                }
-                Err(status) => return Err(rpc_error("get_object", status)),
+        let order: std::collections::HashMap<ObjectID, usize> =
+            ids.iter().enumerate().map(|(position, id)| (*id, position)).collect();
+        for chunk in ids.chunks(Self::FETCH_CONCURRENCY) {
+            let mut pending = JoinSet::new();
+            for id in chunk {
+                let mut client = self.client.clone();
+                let id = *id;
+                pending.spawn(async move { (id, client.get_object(id).await) });
             }
+            // A chunk resolves in whatever order the node answers; results are re-sorted into
+            // request order afterwards so callers can rely on positional correspondence.
+            let mut fetched: Vec<(ObjectID, Object)> = Vec::with_capacity(chunk.len());
+            while let Some(outcome) = pending.join_next().await {
+                let (id, result) = outcome.map_err(|error| ResolveError::Rpc {
+                    call: "get_object",
+                    message: error.to_string(),
+                })?;
+                match result {
+                    Ok(object) => fetched.push((id, object)),
+                    Err(status) if status.code() == Code::NotFound => {
+                        tracing::debug!(object = %id.to_canonical_string(true), "object vanished before it could be fetched");
+                    }
+                    Err(status) => return Err(rpc_error("get_object", status)),
+                }
+            }
+            fetched.sort_by_key(|(id, _)| order.get(id).copied().unwrap_or(usize::MAX));
+            objects.extend(fetched.into_iter().map(|(_, object)| object));
         }
         Ok(objects)
     }

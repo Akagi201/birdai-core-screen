@@ -43,6 +43,13 @@ pub fn is_child_container(tag: &StructTag) -> bool {
 }
 
 /// True when `tag` is Cetus's `skip_list::SkipList<T>`.
+///
+/// Matched by module and name only, with no package-address check. That is deliberate: the
+/// predicate is used to *label* a dump field as a dynamic-field container (whose entries must be
+/// read separately), never to decide what bytes mean — decoding is layout-driven, so a same-named
+/// struct from another package still decodes by its own layout. An upgrade that moves the skip
+/// list to a new package keeps matching without a code change, at the cost of also labelling a
+/// hypothetical same-named inline struct as a container.
 #[must_use]
 pub fn is_cetus_skip_list(tag: &StructTag) -> bool {
     tag.module.as_str() == "skip_list" && tag.name.as_str() == "SkipList"
@@ -117,4 +124,48 @@ pub fn short_address(address: &AccountAddress) -> String {
     let mut out = String::with_capacity(trimmed.len() + 2);
     let _ = write!(out, "0x{trimmed}");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use move_core_types::{
+        account_address::AccountAddress, identifier::Identifier, language_storage::StructTag,
+    };
+
+    use super::{is_cetus_skip_list, short_address, short_tag};
+
+    // Test-only identifiers and addresses are valid by construction.
+    fn ident(text: &str) -> Identifier {
+        Identifier::new(text).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn address(text: &str) -> AccountAddress {
+        text.parse().unwrap_or_else(|_| unreachable!())
+    }
+
+    #[test]
+    fn short_address_keeps_only_significant_digits() {
+        assert_eq!(short_address(&AccountAddress::ZERO), "0x0");
+        assert_eq!(short_address(&AccountAddress::ONE), "0x1");
+        assert_eq!(short_address(&AccountAddress::TWO), "0x2");
+        let full = address("0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb");
+        assert_eq!(
+            short_address(&full),
+            "0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb"
+        );
+    }
+
+    #[test]
+    fn skip_list_matches_by_module_and_name() {
+        let tag = |address: AccountAddress| StructTag {
+            address,
+            module: ident("skip_list"),
+            name: ident("SkipList"),
+            type_params: vec![],
+        };
+        // Any package: the predicate is a labelling hint, not an identity check.
+        assert!(is_cetus_skip_list(&tag(AccountAddress::TWO)));
+        assert!(is_cetus_skip_list(&tag(AccountAddress::ONE)));
+        assert_eq!(short_tag(&tag(AccountAddress::TWO)), "0x2::skip_list::SkipList");
+    }
 }

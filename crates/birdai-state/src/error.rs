@@ -5,9 +5,16 @@ use thiserror::Error;
 /// Something went wrong while keeping state current.
 #[derive(Debug, Error)]
 pub enum StateError {
-    /// A package version observed in the change set could not be read.
-    #[error("could not read package {0}")]
-    Package(String),
+    /// An object in the change set is not a Move object, so it cannot be typed as a venue.
+    #[error("object {0} is not a Move object")]
+    NotMoveObject(String),
+
+    /// A layout resolved for a checkpoint went missing before it could be used.
+    ///
+    /// Defensive: layouts are resolved for exactly the tags being decoded, so this fires only
+    /// on a concurrent eviction racing the decode.
+    #[error("resolved layout for {0} went missing before decode")]
+    MissingLayout(String),
 
     /// An object in the change set could not be found in the checkpoint's object set.
     #[error("object {id} at version {version} is missing from the checkpoint's object set")]
@@ -47,4 +54,8 @@ pub enum StateError {
     /// The tick index of a pool could not be built.
     #[error(transparent)]
     Tick(#[from] birdai_tick::TickError),
+
+    /// The blocking decode pool failed to run.
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
 }
