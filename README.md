@@ -15,14 +15,15 @@ cargo run -- --fixtures fixtures reproduce
 ```
 
 Rust only. The Sui crates are taken from `github.com/MystenLabs/sui` pinned to one revision
-(`b0535f1f3a3310e71790e90d8ae4e8ca840c897e`), toolchain 1.96.1. The first build
+(`f0831497799964f2e364a20a380963fc6b4872c5`), toolchain 1.96.1. The first build
 clones that monorepo and takes a while; `docs/design.md` explains what is reused and why.
 `just deps-check` verifies the pin: every git dependency names a `rev`, and all revs are identical.
 
 By default the run talks to **two** mainnet endpoints, because no single public one does both jobs:
-`fullnode.mainnet.sui.io` for objects and the dynamic-field index, `archive.mainnet.sui.io` for
-checkpoints (a fullnode's checkpoint retention does not reach back to checkpoint 320 577 815, and the
-archival node has no `StateService` at all). Override with `--rpc-url` / `--archive-url`; `--archive-url ""`
+`fullnode.mainnet.sui.io` for latest objects and the dynamic-field index, `archive.mainnet.sui.io`
+for checkpoints and historical object versions (a fullnode's retention reaches neither checkpoint
+320 577 815 nor pool A's version 995 150 484, and the archival node has no `StateService` at all).
+Override with `--rpc-url` / `--archive-url`; `--archive-url ""`
 opts out of the split. Hosted providers that require authentication take `--api-key`.
 
 ## Offline replay
@@ -99,7 +100,7 @@ nearest initialised tick above 72172:
 | **Generics** | `Pool<USDC, SUI>` — both parameters are `phantom`, so they occupy **zero** BCS bytes and the layout is identical for every instantiation. | The fully instantiated `StructTag` is the cache key; the layout comes back substituted, with `Balance<USDC>` and `Balance<SUI>` distinct. |
 | **`Balance<T>`** | `{ value: u64 }`, inlined. Never a child object. | Decoded one level down as a `u64`. |
 | **`Option` vs Cetus's `OptionU64`** | The pool contains **both**: `LinkedTable::head` is std `Option<ID>` (a `vector<T>`, one length byte), while the skip list's `head` is `option_u64::OptionU64 { is_none: bool, v: u64 }` — 9 bytes, payload always present. | The layout says `struct`, so a layout-driven decoder cannot confuse them. A decoder that pattern-matched names would. |
-| **`Table` / `Bag` / `SkipList`** | The parent carries only `{ id: UID, size: u64 }`. Navi's `Storage` is 208 bytes for 35 reserves and ~999k user positions. | Treated as a container: the dump labels it, `size` is used as an assertion against the children actually found, and children are read separately. |
+| **`Table` / `Bag` / `SkipList`** | The parent carries only `{ id: UID, size: u64 }`. Navi's `Storage` is 155 bytes for 35 reserves and ~999k user positions. | Treated as a container: the dump labels it, `size` is used as an assertion against the children actually found, and children are read separately. |
 | **`I32` / `I128`** | Cetus's signed types are `{ bits: u32 }` / `{ bits: u128 }`; the `I32` lives in a **different package** from the pool. | Reinterpreted as two's complement. A mainnet `liquidity_net` reads `340282366920938463463374605480910926342`, i.e. negative. |
 | **Enums (bytecode v6)** | Unused by A/B/C. | Supported by the visitor framework; the dump renders `@variant`. |
 
@@ -149,24 +150,24 @@ link no oracle. Every unit of price in this object is discovered by trading agai
 
 ### Object B — `0x549e8b69…::native_pool::NativePool` (Volo liquid staking): **no**
 
-It is pool-shaped — `pending: Balance<SUI>`, `collectable_fee: Balance<SUI>`, a `vaults` table, a
+It is pool-shaped — `pending` and `collectable_fee` coins, a `vaults` table, a
 `validators` map — and it does hold SUI. But clause (1) fails **structurally and unconditionally**:
 `NativePool` has no type parameters, so no function on it can borrow generic state and exchange two
 of its own assets. Its 77 functions were scanned; the coin-touching ones are `stake` (SUI in, no
-coin out), `unstake` (CETUS in, nothing out), and `mint_ticket`/`burn_ticket` for the certificate —
+coin out), `unstake`/`mint_ticket` (CERT in), and `burn_ticket` for the ticket —
 each moves *one* asset against a share claim. The SUI↔VSUI rate is an accounting ratio,
 `total_staked / total_shares`, that moves when rewards accrue or validators are rebalanced, never
-when somebody trades. Clause (2) fails too: the object holds no price variable at all. Two `Balance`
+when somebody trades. Clause (2) fails too: the object holds no price variable at all. Two coin
 fields and a ratio is a vault, not a venue.
 
 ### Object C — `0xd899cf7d…::storage::Storage` (Navi lending): **no**
 
-Its entire BCS is 208 bytes and contains **no balances**: `reserves` and `user_info` are
+Its entire BCS is 155 bytes and contains **no balances**: `reserves` and `user_info` are
 `0x2::table::Table`s, so the object carries two `UID`s, two lengths and a version, while the 35
 reserves and ~999k user positions live in dynamic fields. Clause (1) fails for the same structural
-reason as B — `Storage` has no type parameters, so `deposit`/`withdraw`/`borrow`/`repay`/`liquidate`
+reason as B — `Storage` has no type parameters, so `deposit`/`withdraw`/`borrow`/`repay`
 each move one asset against a share claim and none of them can exchange two of the object's own
-assets. Clause (2) fails: nothing in those 208 bytes is a price. Clause (3) **fails as well**: the
+assets. Clause (2) fails: nothing in those 155 bytes is a price. Clause (3) **fails as well**: the
 package statically links `oracle::PriceOracle`, reached from `calculator`, `dynamic_calculator`,
 `lending` and `logic`. Asset values are imported and interest is a utilisation curve; `Storage` is a
 ledger, and a ledger with a price feed attached is still not a place where price is discovered.
@@ -197,9 +198,11 @@ result
 ```
 
 **Liquidity, price and range in force.** At the version T consumed, the active tick range is
-`[71_060, 71_180)`, with `L = 120_115_891_674_982`; the next initialised tick above is `71_180` at
-`sqrt_price = 647_882_882_935_015_212_980`. (That bracketing is version-pinned history: the pool
-has traded since, so a live run brackets the *current* tick against *today's* children instead.)
+`[71_060, 71_190)`, with `L = 120_115_891_674_982`; the next initialised tick above is `71_190` at
+`sqrt_price = 648_206_889_171_250_166_865`. (Both live and fixture runs print this bracketing,
+because the tick set can only ever be read at its current version: the `71_180` tick seen at
+research time has since been burned, which is exactly why the quote is proven without the tick
+set — see the spacing argument below.)
 The step reaches `647_324_162_169_833_037_484`, which is
 below that, so **no tick is crossed and `L` is constant** — one step, exactly as the transaction
 description says. The move is 0.474 ticks, against a `tick_spacing` of 10.
@@ -309,12 +312,14 @@ obvious beforehand. They are listed because the reasoning matters more than the 
    `x-token-id` and `Authorization: Bearer`. `--api-key` is supported anyway, since providers that do
    offer gRPC expect the header; the capture above came from the public `fullnode.mainnet.sui.io`.
 11. **Sui's two public mainnet endpoints are not interchangeable, so the run talks to both.**
-   `fullnode.mainnet.sui.io` serves the whole API but keeps only a bounded window of checkpoints;
-   `archive.mainnet.sui.io` keeps the full history but does **not** implement `StateService` —
-   `ListDynamicFields` answers `Unimplemented` there. Transaction T is in checkpoint 320 577 815, which
-   is outside a fullnode's retention, so checkpoints are routed to the archival endpoint while dynamic
-   fields stay on the fullnode (`--archive-url`, defaulting to `archive.mainnet.sui.io`, with `""`
-   opting out). This also explains the transient `unavailable` errors seen before the split.
+    `fullnode.mainnet.sui.io` serves the whole API but keeps only a bounded window of history;
+    `archive.mainnet.sui.io` keeps the full history but does **not** implement `StateService` —
+    `ListDynamicFields` answers `Unimplemented` there. Transaction T is in checkpoint 320 577 815 and
+    consumes pool A at version 995 150 484, both outside a fullnode's retention, so checkpoints *and
+    versioned object reads* are routed to the archival endpoint while latest reads and dynamic
+    fields stay on the fullnode (`--archive-url`, defaulting to `archive.mainnet.sui.io`, with `""`
+    opting out). This also explains the transient `unavailable` errors seen before the split — and
+    the `object … not found at version 995150484` failure that forced the versioned-read half of it.
 12. **One bad object must not kill a checkpoint.** Replaying the captured checkpoint through the
    state manager surfaced two cases the happy path never meets: the same pool mutated twice in one
    checkpoint (so a naive re-apply walks versions backwards), and a second Cetus deployment whose
@@ -342,7 +347,7 @@ crates/birdai-amm          tick math, delta math, exact-input swap, CheckedU256 
 crates/birdai-tick         the Cetus tick skip list: decode, index, validate, bracket
 crates/birdai-venue        typed venues and the price-discovery classifier
 crates/birdai-state        checkpoint-driven in-memory venue state
-docs/design.md             the full design, including the 29 defects found across two reviews
+docs/design.md             the full design, including the 33 defects found across two reviews
 ```
 
 `birdai-amm` and `birdai-tick` have no network dependency and are exercised entirely by unit and
@@ -354,20 +359,20 @@ deps-check` verifies the Sui pin.
 ```
 $ cargo test --all-features
   birdai (bin)      5 passed   # incl. B/C decoding offline as vault and ledger
-  birdai-amm       46 passed   # incl. output_matches_the_chain_exactly (Δ = 0)
+  birdai-amm       50 passed   # incl. output_matches_the_chain_exactly (Δ = 0)
   birdai-move       6 passed
-  birdai-resolve   15 passed
-  birdai-state      4 passed   # incl. offline replay of checkpoint 320577815
-  birdai-tick      34 passed
-  birdai-venue      6 passed
+  birdai-resolve   17 passed
+  birdai-state      5 passed   # incl. offline replay of checkpoint 320577815
+  birdai-tick      35 passed
+  birdai-venue      7 passed
   birdai-amm doctest 1 passed
   ─────────────────────────
-  117 passed, 0 failed
+  126 passed, 0 failed
 
 $ cargo run -- --fixtures fixtures reproduce   # 81_168_759 out, difference 0, ✔ exact match
 $ just lint        # typos, rumdl, cargo-sort, nightly fmt --check, nightly clippy -D warnings,
                    # cargo-shear, workspace-inheritance-check — all green
-$ just deps-check  # all git dependencies pinned at b0535f1f...
+$ just deps-check  # all git dependencies pinned at f0831497...
 ```
 
 Mutation testing: a scoped `cargo mutants` run over `birdai-tick/src/index.rs` (where the
@@ -380,7 +385,7 @@ reverting the guard by hand and watching exactly its test fail.
 
 Everything in the brief is implemented and verified against mainnet: decode (including a tick child),
 classify, reproduce (`Δ = 0`), and the state manager described in the design note, which runs against
-the live checkpoint stream and loads a freshly seen pool's ticks on first sight. 117 tests and a
+the live checkpoint stream and loads a freshly seen pool's ticks on first sight. 126 tests and a
 pedantic Clippy pass with `-D warnings`. Known limitations, all deliberate:
 
 * The layout cache's upgrade invalidation is exercised by unit tests on the dependency graph, not yet

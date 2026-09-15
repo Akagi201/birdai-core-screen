@@ -98,7 +98,7 @@ pub trait ObjectSource: Send + Sync {
 #[derive(Clone)]
 pub struct GrpcObjectSource {
     client: Client,
-    /// Endpoint used only for `Checkpoint` reads, when one is configured.
+    /// Endpoint used for `Checkpoint` and versioned-object reads, when one is configured.
     checkpoint_client: Option<Client>,
 }
 
@@ -186,19 +186,44 @@ impl ObjectSource for GrpcObjectSource {
     async fn object(&self, id: ObjectID, version: Option<u64>) -> Result<Object, ResolveError> {
         // `Client` methods that mutate take `&mut self`; cloning the handle is cheap and keeps the
         // source usable from many threads without a lock.
-        let mut client = self.client.clone();
-        let result = match version {
-            Some(version) => {
-                client.get_object_with_version(id, SequenceNumber::from_u64(version)).await
+        async fn fetch(
+            client: &Client,
+            id: ObjectID,
+            version: Option<u64>,
+        ) -> Result<Object, ResolveError> {
+            let mut client = client.clone();
+            let result = match version {
+                Some(version) => {
+                    client.get_object_with_version(id, SequenceNumber::from_u64(version)).await
+                }
+                None => client.get_object(id).await,
+            };
+            match result {
+                Ok(object) => Ok(object),
+                Err(status) if status.code() == Code::NotFound => {
+                    Err(ResolveError::ObjectNotFound { id: id.to_canonical_string(true), version })
+                }
+                Err(status) => Err(rpc_error("get_object", status)),
             }
-            None => client.get_object(id).await,
+        }
+
+        let Some(archival) = &self.checkpoint_client else {
+            return fetch(&self.client, id, version).await;
         };
-        match result {
+        // A versioned read is history: the fullnode prunes it while the archive keeps it, so the
+        // archive goes first. A latest read is the opposite: the fullnode is authoritative and the
+        // archive may lag, so it stays on the fullnode with the archive as fallback.
+        // Dynamic fields never come here; the archive has no `StateService`.
+        let (first, second) = match version {
+            Some(_) => (archival, &self.client),
+            None => (&self.client, archival),
+        };
+        match fetch(first, id, version).await {
             Ok(object) => Ok(object),
-            Err(status) if status.code() == Code::NotFound => {
-                Err(ResolveError::ObjectNotFound { id: id.to_canonical_string(true), version })
+            Err(first_error) => {
+                tracing::debug!(object = %id.to_canonical_string(true), version = ?version, %first_error, "object read failed; retrying on the other endpoint");
+                fetch(second, id, version).await
             }
-            Err(status) => Err(rpc_error("get_object", status)),
         }
     }
 

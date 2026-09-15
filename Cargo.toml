@@ -11,11 +11,11 @@ license = "Apache-2.0"
 repository = "TODO"
 
 [workspace.dependencies]
-move-binary-format        = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
-move-core-types           = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
-sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e", default-features = false }
-sui-package-resolver      = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
-sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+move-binary-format        = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
+move-core-types           = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
+sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5", default-features = false }
+sui-package-resolver      = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
+sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
 # ---------------------------------------------------------------------------
 # Sui / Move. Every entry MUST share one `rev` so the workspace moves forward
 # atomically. See docs/design.md §2 and §14 item 21.
@@ -33,7 +33,7 @@ sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "
 # `just lint` / CI clippy. `third-party/allocative` is 0.3.4 with exactly that
 # redundant impl removed; see its README for the removal condition.
 # ---------------------------------------------------------------------------
-sui-types                 = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+sui-types                 = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
 
 # --- internal ---
 birdai-amm     = { path = "crates/birdai-amm" }

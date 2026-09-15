@@ -22,7 +22,8 @@ thin, well-factored layer on top of the Sui crates rather than a reimplementatio
 | Recreate T | `birdai-amm` integer CLMM math on the pre-state | `cargo run -- reproduce` → **81 168 759, matches chain** |
 | Design note | `birdai-state` on `sui-indexer-alt-framework::ingestion` | `cargo run -- follow --from 320577815` + README §4 |
 
-Pinned upstream: Sui `main` @ **`b0535f1f3a3310e71790e90d8ae4e8ca840c897e`**,
+Pinned upstream: Sui `main` @ **`f0831497799964f2e364a20a380963fc6b4872c5`**
+(was `b0535f1f3a3310e71790e90d8ae4e8ca840c897e` at research time; bumped as one atomic move),
 toolchain **1.96.1**, edition 2024. `just deps-check` enforces the pin: every git dependency
 names a `rev`, and all revs are identical (verified — the whole workspace moves atomically).
 
@@ -113,10 +114,12 @@ Initialised ticks bracketing `71162`:
 | 71050 | 643_685_510_299_636_945_792 | below |
 | **71060** | 644_007_417_429_774_971_181 | **lower bound of the active range** |
 | 71162 | — | current (not on the grid; spacing is 10) |
-| **71180** | 647_882_882_935_015_212_980 | **upper bound / next initialised tick** |
-| 71190 | 648_206_889_171_250_166_865 | above |
+| ~~**71180**~~ | ~~647_882_882_935_015_212_980~~ | ~~upper bound at research time — since burned~~ |
+| **71190** | 648_206_889_171_250_166_865 | **upper bound / next initialised tick** |
 
-Active range **[71060, 71180)**, active liquidity `L = 120_115_891_674_982`.
+Active range **[71060, 71190)**, active liquidity `L = 120_115_891_674_982`.
+(The `71180` tick existed at research time and is gone now — live proof that the tick set can
+only be read at its current version, and that the quote must not depend on it.)
 
 ### 1.4 Reproduction
 
@@ -128,8 +131,9 @@ S'   = S + ΔS = 647_324_162_169_833_037_484
 out  = ⌊ (L ≪ 64) · ΔS / (S · S') ⌋ = 81_168_759     ← chain: 81_168_759, Δ = 0
 ```
 
-`S' = 647_324_162_169_833_037_484 < sqrt_price(71180) = 647_882_882_935_015_212_980`
+`S' = 647_324_162_169_833_037_484 < sqrt_price(71190) = 648_206_889_171_250_166_865`
 → **no tick crossing; one step; `L` constant.** In tick units the move is ≈ 0.47 tick.
+(`S'` is below the research-time `sqrt_price(71180)` a fortiori.)
 
 ### 1.5 Objects B and C
 
@@ -137,7 +141,7 @@ out  = ⌊ (L ≪ 64) · ΔS / (S · S') ⌋ = 81_168_759     ← chain: 81_168_
 `id`, `pending { id, balance: Balance<SUI> }`, `collectable_fee { id, balance }`,
 `validator_set { id, vaults: Table{ id, size: 5 }, validators: 0x2::vec_map::VecMap { contents: [(address, u64)] }, sorted_validators: vector<address>, … }`.
 
-**C — Navi `Storage`** `0xd899cf7d…::storage::Storage` (208 bytes total):
+**C — Navi `Storage`** `0xd899cf7d…::storage::Storage` (155 bytes in the captured set; 208 at research time):
 `id`, `version: u64 = 16`, `paused: bool = false`,
 `reserves: 0x2::table::Table<u8, ReserveData> { id, size: 35 }`, `reserves_count: u8 = 35`,
 `users: vector<address>`, `user_info: 0x2::table::Table<address, UserInfo> { id, size: 999_105 }`.
@@ -156,13 +160,13 @@ database/systemd weight.**
 channel = "1.96.1"           # must match the Sui workspace
 
 # Cargo.toml  [workspace.dependencies]
-SUI_REV = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e"
-sui-types                 = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
-sui-package-resolver      = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
-sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
-sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e", default-features = false }
-move-core-types           = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
-move-binary-format        = { git = "https://github.com/MystenLabs/sui", rev = "b0535f1f3a3310e71790e90d8ae4e8ca840c897e" }
+SUI_REV = "f0831497799964f2e364a20a380963fc6b4872c5"   # was b0535f1f… at research time; bumped as one atomic move
+sui-types                 = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
+sui-package-resolver      = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
+sui-rpc-api               = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
+sui-indexer-alt-framework = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5", default-features = false }
+move-core-types           = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
+move-binary-format        = { git = "https://github.com/MystenLabs/sui", rev = "f0831497799964f2e364a20a380963fc6b4872c5" }
 ```
 
 `move-core-types` and `move-binary-format` live in the same repository
@@ -621,7 +625,8 @@ while remaining > 0 {
 }
 ```
 
-and the **crossing branch is asserted dead for T**: `S' < sqrt_price(71180)`, so no tick is crossed and
+and the **crossing branch is asserted dead for T**: `S' < sqrt_price(71190)` (and a fortiori
+below the research-time `sqrt_price(71180)`), so no tick is crossed and
 the single-step result is the final result.
 
 ### 7.3 Why `U256` is sufficient (rev 1 got this wrong)
@@ -963,7 +968,7 @@ plausible one.
 | 23 | §7.1 | `ObjectSource::objects` can be a batched RPC call. | `Client::batch_get_objects` collapses a **single** missing object into a wholesale error, and a missing object is not exotic: enumerating a pool's 650 tick nodes and fetching them afterwards leaves a window in which a tick is removed. This took a capture down. | Batch first for round-trip efficiency, then retry object by object and skip anything that is gone. The retry is in the source, so every caller inherits it. |
 | 24 | — | A fixture directory that does not exist can load as an empty set. | That turned a mistyped `--fixtures` path into "object not found" three commands later. | `Fixtures::load` requires the manifest and fails with `FixtureError::Missing` naming the directory. The committed-set tests skip explicitly on absence instead of relying on silent defaults. |
 | 25 | — | Hosted providers' Sui endpoints serve gRPC v2. | `shared.eu-central-1.getblock.io/<key>` answered every request with `Missing token-id` — with the key in the URL path, and in `x-api-key`, `x-token-id` and `Authorization: Bearer` in turn. | `--api-key` is supported (sending the first two plus a bearer token) because providers that *do* offer gRPC expect a header; the capture used Sui's own endpoints. Worth proving the keyed path against a provider that enables it. |
-| 26 | §4.1 | One endpoint is enough. | **Sui's two public mainnet endpoints are not interchangeable.** `fullnode.mainnet.sui.io` serves the whole API but keeps only a bounded window of checkpoints — `GetObject` succeeds while `GetCheckpoint` for checkpoint 320 577 815 returns transient `unavailable` or `NotFound`. `archive.mainnet.sui.io` keeps the full history but does **not** implement `StateService`: `ListDynamicFields` answers `Unimplemented`. | `GrpcObjectSource` holds a second client used only for `Checkpoint` reads, with a fallback to the primary on archival failure, and `--archive-url` (default `archive.mainnet.sui.io`, `""` to opt out). This is the same shape the validator variant takes — one source, several transports behind it — so it cost a field rather than a redesign. |
+| 26 | §4.1 | One endpoint is enough. | **Sui's two public mainnet endpoints are not interchangeable.** `fullnode.mainnet.sui.io` serves the whole API but keeps only a bounded window of checkpoints — `GetObject` succeeds while `GetCheckpoint` for checkpoint 320 577 815 returns transient `unavailable` or `NotFound`. `archive.mainnet.sui.io` keeps the full history but does **not** implement `StateService`: `ListDynamicFields` answers `Unimplemented`. | `GrpcObjectSource` holds a second client used for `Checkpoint` reads, with a fallback to the primary on archival failure, and `--archive-url` (default `archive.mainnet.sui.io`, `""` to opt out). The same split later covered versioned object reads too — the fullnode prunes those as well, so `object` routes `Some(version)` to the archive first and `None` to the fullnode first, each falling back to the other. This is the same shape the validator variant takes — one source, several transports behind it — so it cost a branch rather than a redesign. |
 | 27 | §10 | Mutation testing is future work. | `cargo mutants -p birdai-amm -p birdai-tick` (248 mutants): 204 caught, 38 unviable, 6 missed — and the 6 split into 4 equivalent-by-construction plus 2 real gaps. The gaps were a self-linking skip-list node (it resolves in the score map, so only the `!= position` half of the resolvability check rejects it) and a negative price deviation whose magnitude needs a subtraction (division collapses every small negative deviation to −1). | Both gaps now have killer tests; a scoped re-run over `birdai-tick/src/index.rs` reports 103 caught, 33 unviable, **0 missed**. The 4 equivalents (`delta_a`/`delta_b` `||`→`&&`, min-clamp `<`→`==`/`<=`) are pinned by in-code comments plus tests that lock the equivalence. Effective kill rate on killable mutants: 100%. |
 | 28 | §8.3 | A tick snapshot read over RPC is consistent. | It is not, on a live pool: listing the children is paginated and fetching them is a later round trip, so a tick added or removed in between leaves a snapshot whose link graph does not close. Online `reproduce` failed with `node 515776 links to 515836, which is not in the index` — the pool had grown new ticks since the fixtures were captured. Retrying the fetch alone cannot help, because the inconsistency is in the *listing*, not the fetch. | `load_tick_index` re-takes the whole snapshot once on any validation failure and only then fails loudly. Observed live: the retry fired (`node 508836 links to 508866`), the second snapshot validated, and the quote still matched the chain exactly. |
 | 29 | §2.2 | `just lint` passes as written. | It did not, for three reasons, all outside our code: (a) `allocative <= 0.3.5` fails on recent nightlies (duplicate `Allocative` impls for `!` vs `Infallible`, E0119), which reds the nightly-clippy step and CI with it; (b) `cargo workspace-inheritance-check --check` was never a valid flag — the tool checks by default; (c) 23 declared dependencies were dead (template leftovers like `config`/`rustls`, and refs removed by refactors such as `sui-rpc-resolver` after item 22). | (a) `third-party/allocative`: vendored 0.3.4 with exactly the redundant `!` impl deleted (stable never compiled it, so behaviour is unchanged there) plus warning fixes, wired via `[patch.crates-io]` kept last in the root manifest — a `[patch.*]` header ends the preceding table, so it must never be spliced into `[workspace.dependencies]`. (b) The Justfile recipe now calls the tool bare. (c) All 23 removed after grep-verifying zero uses; `cargo shear` is clean. |

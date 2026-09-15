@@ -283,7 +283,7 @@ pub(crate) async fn classify(session: &Session) -> eyre::Result<()> {
         "     (`PriceOracle` reached from `lending`, `logic`, `calculator`, `dynamic_calculator`);"
     );
     println!(
-        "     and the object holds no price state — its 208 bytes are versions, tables and counts."
+        "     and the object holds no price state — its 155 bytes are versions, tables and counts."
     );
     Ok(())
 }

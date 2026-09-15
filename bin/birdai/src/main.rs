@@ -35,12 +35,13 @@ struct Cli {
     #[arg(long, env = "BIRDAI_API_KEY", global = true)]
     api_key: Option<String>,
 
-    /// Archival endpoint used for checkpoint reads.
+    /// Archival endpoint used for checkpoint and historical-object reads.
     ///
-    /// Sui's public fullnode keeps only a bounded window of checkpoints, while
+    /// Sui's public fullnode keeps only a bounded window of history, while
     /// `archive.mainnet.sui.io` keeps the whole history — but the archival node does not
     /// implement `StateService`, so `ListDynamicFields` is unavailable there. A run that needs
-    /// both an old checkpoint and the current dynamic-field index has to talk to both.
+    /// old state as well as the current dynamic-field index has to talk to both: versioned
+    /// object reads prefer the archive, latest reads and dynamic fields stay on the fullnode.
     #[arg(
         long,
         env = "BIRDAI_ARCHIVE_URL",

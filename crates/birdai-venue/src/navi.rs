@@ -1,6 +1,6 @@
 //! Navi lending storage: `…::storage::Storage`.
 //!
-//! The most instructive of the three objects. Its whole BCS is 208 bytes and contains **no**
+//! The most instructive of the three objects. Its whole BCS is 155 bytes and contains **no**
 //! balances at all: `reserves` and `user_info` are `0x2::table::Table`s, so the object carries two
 //! `UID`s and two lengths while the 35 reserves and ~999k user positions live in dynamic fields.
 //!
