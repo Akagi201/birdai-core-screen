@@ -33,6 +33,9 @@ pub(crate) struct Session {
     registry: Option<Arc<RpcLayoutRegistry>>,
     /// The fixture directory, when running offline.
     fixtures: Option<PathBuf>,
+    /// The loaded fixture set, when offline — commands that need to know what was captured
+    /// (how many checkpoints, in which order) read it from here rather than from the sources.
+    fixture_set: Option<Arc<Fixtures>>,
     /// The endpoint, when running online.
     rpc_url: Option<String>,
 }
@@ -75,6 +78,7 @@ impl Session {
             layouts: registry.clone(),
             registry: Some(registry),
             fixtures: None,
+            fixture_set: None,
             rpc_url: Some(rpc_url.to_owned()),
         })
     }
@@ -83,14 +87,24 @@ impl Session {
     pub(crate) fn offline(dir: &Path) -> eyre::Result<Self> {
         let fixtures = Arc::new(Fixtures::load(dir)?);
         let objects = Arc::new(FixtureObjectSource::new(fixtures.clone()));
-        let layouts = Arc::new(FixtureLayoutSource::new(fixtures));
+        let layouts = Arc::new(FixtureLayoutSource::new(fixtures.clone()));
         Ok(Self {
             objects,
             layouts,
             registry: None,
             fixtures: Some(dir.to_path_buf()),
+            fixture_set: Some(fixtures),
             rpc_url: None,
         })
+    }
+
+    /// The checkpoint sequence numbers the fixture set holds, in order. Empty when online.
+    #[must_use]
+    pub(crate) fn fixture_checkpoints(&self) -> Vec<u64> {
+        self.fixture_set
+            .as_ref()
+            .map(|fixtures| fixtures.checkpoints.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// The concrete registry, when online.
@@ -108,7 +122,7 @@ impl Session {
     /// Whether this session is serving fixtures.
     #[must_use]
     pub(crate) const fn is_offline(&self) -> bool {
-        self.fixtures.is_some()
+        self.fixture_set.is_some()
     }
 
     /// Fetch an object, resolve its layout and dump it field by field.

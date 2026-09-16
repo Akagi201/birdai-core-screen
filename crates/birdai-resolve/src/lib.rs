@@ -33,7 +33,7 @@ pub mod store;
 use std::sync::Arc;
 
 pub use error::ResolveError;
-pub use layout::{CacheStats, Fingerprint, LayoutRegistry, LayoutSource};
+pub use layout::{CacheStats, Fingerprint, LayoutRegistry, LayoutSource, PackageVersions};
 pub use object::{
     API_KEY_HEADER, DYNAMIC_FIELD_PAGE_SIZE, DynamicFieldPage, DynamicFieldRef, GrpcObjectSource,
     ObjectSource,
@@ -57,11 +57,16 @@ pub const LAYOUT_LIMITS: sui_package_resolver::Limits = sui_package_resolver::Li
 };
 
 /// A [`LayoutRegistry`] over any object source.
+///
+/// The package store and the layout cache share one [`PackageVersions`] tracker, so a checkpoint's
+/// observations invalidate both the resolved layout and the bytecode it came from.
 pub fn layout_registry_over<O: ObjectSource + 'static>(
     source: Arc<O>,
 ) -> LayoutRegistry<SourcePackageStore<O>> {
-    let resolver = Resolver::new_with_limits(SourcePackageStore::new(source), LAYOUT_LIMITS);
-    LayoutRegistry::new(Arc::new(resolver))
+    let versions = PackageVersions::new();
+    let store = SourcePackageStore::with_versions(source, versions.clone());
+    let resolver = Resolver::new_with_limits(store, LAYOUT_LIMITS);
+    LayoutRegistry::with_versions(Arc::new(resolver), versions)
 }
 
 /// Build a resolver that reads package bytecode from `url`.
@@ -89,7 +94,7 @@ mod tests {
         language_storage::{StructTag, TypeTag},
     };
 
-    use super::layout::{LayoutRegistry, collect_dependencies, fingerprint};
+    use super::layout::{LayoutRegistry, PackageVersions, collect_dependencies, fingerprint};
 
     /// The literals these tests use are valid Move identifiers by construction, and `Identifier`
     /// offers no infallible constructor; a failure here would be a bug in the test itself.
@@ -143,7 +148,7 @@ mod tests {
             ],
         );
 
-        let dependencies = collect_dependencies(&outer, &std::collections::HashMap::new());
+        let dependencies = collect_dependencies(&outer, &PackageVersions::new());
         let addresses: Vec<AccountAddress> = dependencies.iter().map(|(a, _)| *a).collect();
         assert!(addresses.contains(&AccountAddress::ONE));
         assert!(addresses.contains(&AccountAddress::TWO));
@@ -155,7 +160,8 @@ mod tests {
     #[test]
     fn observed_versions_are_recorded_against_the_layout() {
         let layout = struct_layout("coin", "Coin", vec![("value", MoveTypeLayout::U64)]);
-        let live = std::collections::HashMap::from([(AccountAddress::TWO, 9)]);
+        let live = PackageVersions::new();
+        live.observe(&[(AccountAddress::TWO, 9)]);
         let dependencies = collect_dependencies(&layout, &live);
         assert_eq!(dependencies, vec![(AccountAddress::TWO, 9)]);
     }
@@ -223,11 +229,10 @@ mod tests {
         };
         with_param.type_.type_params = vec![TypeTag::Struct(Box::new(inner))];
         let layout = MoveTypeLayout::Struct(with_param);
-        let addresses: Vec<AccountAddress> =
-            collect_dependencies(&layout, &std::collections::HashMap::new())
-                .iter()
-                .map(|(a, _)| *a)
-                .collect();
+        let addresses: Vec<AccountAddress> = collect_dependencies(&layout, &PackageVersions::new())
+            .iter()
+            .map(|(a, _)| *a)
+            .collect();
         assert!(addresses.contains(&AccountAddress::ONE));
         assert!(addresses.contains(&AccountAddress::TWO));
     }

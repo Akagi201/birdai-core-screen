@@ -13,17 +13,21 @@
 //! * Each of the pool's reserves is a `0x2::balance::Balance<T>`, i.e. a `u64`, so the **virtual**
 //!   reserves are bounded by total supply: `a_v, b_v < 2^64`.
 //! * The pool maintains `L = √(a_v · b_v)` for the active range, so **`L < 2^64`**.
+//! * A swap's input is a coin amount, i.e. a `u64` — the signature takes a `u128`, but the
+//!   hypothesis `amount_in < 2^64` is what the pool guarantees and what the bound below needs.
 //! * The output is `⌊(L ≪ 64) · ΔS / (S · S')⌋` with `ΔS = ⌊amount_in · 2^64 / L⌋ < 2^128`. Hence
 //!   `(L ≪ 64) · ΔS < 2^128 · 2^128 = 2^256`, which fits `U256` exactly.
 //! * The denominator `S · S'` has `S, S' < 2^128`, so it is also `< 2^256`.
 //!
 //! Every intermediate therefore fits in [`move_core_types::u256::U256`], and no wider type is
-//! needed. Arithmetic goes through [`CheckedU256`], because `U256`'s own operators wrap.
+//! needed. Arithmetic goes through [`CheckedU256`], because `U256`'s own operators wrap: an input
+//! outside that hypothesis fails loudly instead of returning a wrapped answer.
 //!
 //! # Rounding
 //!
-//! All directions favour the pool: fees floor, the price an input reaches floors, outputs floor,
-//! and amounts the pool is owed ceil. [`swap`] documents the transaction that pins this down.
+//! Every direction matches the pool's: fees floor, outputs floor, and what the trader owes — the
+//! amount a step costs, and the price an A-in step reaches — ceils. [`swap`] documents the
+//! transaction that pins this down.
 //!
 //! # Mainnet anchor
 //!

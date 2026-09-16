@@ -9,9 +9,11 @@
 //!
 //! # Rounding
 //!
-//! Every rounding direction is chosen to favour the pool, which is what the on-chain math does:
-//! the fee is floored, the price the input reaches is floored, the output is floored, and any
-//! amount the pool is *owed* is ceiled. [`crate`] documents why this reproduces the chain exactly.
+//! Every rounding direction matches the pool's, and it is the pool's own combination of the two:
+//! the fee is floored, the output is floored (the pool never pays out more than it owes), and
+//! anything that moves *towards* the pool — the amount the trader owes for a step, and the price an
+//! A-in step reaches — is ceiled, so a step can never take the pool further than the input paid
+//! for. [`crate`] documents why this reproduces the chain exactly.
 
 use crate::{checked::CheckedU256, error::AmmError, tick::Q64};
 
@@ -370,7 +372,10 @@ pub fn swap_exact_in(
             break;
         }
 
-        let Some(boundary) = boundary else {
+        // Landing on the price limit is *not* crossing a tick. When the boundary lies beyond the
+        // limit, `limit` was clamped to the limit and the price never reached the tick, so its
+        // liquidity must not be applied and its tick must not be reported as the one in force.
+        let Some(boundary) = boundary.filter(|boundary| boundary.sqrt_price == sqrt_price) else {
             // Reached the swap's price limit rather than a tick; nothing more to do.
             break;
         };
@@ -396,7 +401,12 @@ pub fn swap_exact_in(
         }
     }
 
-    // ponytail: fee is charged only on consumed input; truncated swaps refund the rest.
+    // Fee is charged only on consumed input; truncated swaps refund the rest. The `net_input == 0`
+    // arm is not redundant with `remaining == 0` — it guards the division below — but the pair is
+    // equivalent to `remaining == 0` alone: `remaining <= net_input`, so `net_input == 0` implies
+    // `remaining == 0` and pays the same zero fee, and `remaining == 0` with a non-zero `net_input`
+    // takes the refund branch only to refund `fee · 0 / net_input = 0`. Mutating `||` to `&&`
+    // therefore changes nothing observable; the branch order is what the tests pin.
     let fee_charged = if remaining == 0 || net_input == 0 {
         fee
     } else {
@@ -947,6 +957,56 @@ mod tests {
     }
 
     #[test]
+    fn stopping_at_the_price_limit_does_not_cross_the_boundary_beyond_it() -> Result<(), AmmError> {
+        // The limit sits halfway to the only boundary, so the price stops short of the tick. Its
+        // `liquidity_net` belongs to a tick the price never reached: applying it would move both
+        // the reported liquidity and the reported tick to the far side of a boundary that was not
+        // crossed.
+        let mid = T_SQRT_PRICE + (T_NEXT_SQRT_PRICE - T_SQRT_PRICE) / 2;
+        let result = swap_exact_in(
+            &SingleBoundary,
+            Direction::BtoA,
+            PoolState { fee_rate: 0, ..T_STATE },
+            50_000_000_000_000,
+            mid,
+            8,
+        )?;
+        assert_eq!(result.sqrt_price_end, mid);
+        assert_eq!(result.liquidity_end, T_LIQUIDITY, "the boundary's liquidity is not in force");
+        assert_eq!(result.tick_end, T_TICK, "no tick was crossed");
+        assert!(result.is_single_step());
+        Ok(())
+    }
+
+    #[test]
+    fn a_boundary_beyond_the_price_limit_is_not_counted_as_a_crossing() -> Result<(), AmmError> {
+        // With the same truncated swap, not one boundary was crossed — so a caller that allows no
+        // crossings at all must get a quote, not `TooManyCrossings`.
+        let mid = T_SQRT_PRICE + (T_NEXT_SQRT_PRICE - T_SQRT_PRICE) / 2;
+        let result = swap_exact_in(
+            &SingleBoundary,
+            Direction::BtoA,
+            PoolState { fee_rate: 0, ..T_STATE },
+            50_000_000_000_000,
+            mid,
+            0,
+        )?;
+        assert_eq!(result.sqrt_price_end, mid);
+        Ok(())
+    }
+
+    #[test]
+    fn one_unit_of_price_move_is_worth_less_than_one_base_unit_of_output() -> Result<(), AmmError> {
+        // T's step is `ΔS = floor(in·2^64 / L)`. Rounding it up instead moves the price by one
+        // unit, which at this step width buys less than one base unit of USDC — so the reproduction
+        // does not rest on which side of the floor the chain took.
+        let delta = next_sqrt_price_up(T_SQRT_PRICE, T_LIQUIDITY, 99_950_000_000)? - T_SQRT_PRICE;
+        let reached = T_SQRT_PRICE + delta;
+        assert_eq!(delta_a(reached, reached + 1, T_LIQUIDITY, false)?, 0);
+        Ok(())
+    }
+
+    #[test]
     fn truncated_swaps_charge_fee_only_on_consumed_input() -> Result<(), AmmError> {
         // ponytail: non-zero fee plus a limit that truncates must not charge the full fee.
         let mid = T_SQRT_PRICE + (T_NEXT_SQRT_PRICE - T_SQRT_PRICE) / 2;
@@ -995,9 +1055,61 @@ mod tests {
             swap_exact_in(&SingleBoundary, Direction::BtoA, T_STATE, 0, MAX_SQRT_PRICE, 8)?;
         assert_eq!(result.amount_out, 0);
         assert_eq!(result.fee, 0);
-        assert!(result.steps.is_empty());
+        assert_eq!(result.steps.len(), 0);
         assert_eq!(result.sqrt_price_end, T_SQRT_PRICE);
         assert!(result.input_consumed);
+        Ok(())
+    }
+
+    /// A source whose only boundary sits exactly at the pool's current price.
+    struct BoundaryAtPrice {
+        direction: Direction,
+    }
+
+    impl TickSource for BoundaryAtPrice {
+        fn next_boundary_up(&self, _tick: i32) -> Option<Boundary> {
+            (self.direction == Direction::BtoA).then_some(Boundary {
+                tick: T_TICK,
+                sqrt_price: T_SQRT_PRICE,
+                liquidity_net: 1_000,
+            })
+        }
+
+        fn next_boundary_down(&self, _tick: i32) -> Option<Boundary> {
+            (self.direction == Direction::AtoB).then_some(Boundary {
+                tick: T_TICK,
+                sqrt_price: T_SQRT_PRICE,
+                liquidity_net: 1_000,
+            })
+        }
+    }
+
+    #[test]
+    fn a_boundary_exactly_at_the_price_is_behind_not_ahead() -> Result<(), AmmError> {
+        // A pool can sit exactly on an initialised tick. That tick's liquidity is already in force,
+        // so a source handing it back must not be read as a boundary ahead: stepping to it would be
+        // no progress at all. Both directions must quote exactly what an empty tick set quotes.
+        for direction in [Direction::BtoA, Direction::AtoB] {
+            let limit = match direction {
+                Direction::BtoA => MAX_SQRT_PRICE,
+                Direction::AtoB => MIN_SQRT_PRICE,
+            };
+            let expected = swap_exact_in(&EmptySource, direction, T_STATE, T_AMOUNT_IN, limit, 8)?;
+            let result = swap_exact_in(
+                &BoundaryAtPrice { direction },
+                direction,
+                T_STATE,
+                T_AMOUNT_IN,
+                limit,
+                8,
+            )?;
+            assert_eq!(result.amount_out, expected.amount_out);
+            assert_eq!(result.sqrt_price_end, expected.sqrt_price_end);
+            assert_eq!(
+                result.liquidity_end, expected.liquidity_end,
+                "the tick at the price is already in force"
+            );
+        }
         Ok(())
     }
 

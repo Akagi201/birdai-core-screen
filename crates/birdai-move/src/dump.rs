@@ -2,8 +2,9 @@
 //!
 //! This is the human-facing half of decoding: it walks the layout and the bytes together and
 //! records, for every value it sees, the **exact BCS byte range** it came from. That range is not
-//! decoration — the test suite re-decodes each leaf from its own slice and asserts it round-trips,
-//! which is what makes the dump trustworthy enough to quote in the README.
+//! decoration — [`tests::byte_ranges_slice_back_to_the_same_values`] cuts each leaf out of the
+//! object's bytes by its recorded range and re-decodes it, which is what makes the dump
+//! trustworthy enough to quote in the README.
 
 use std::ops::Range;
 
@@ -391,6 +392,7 @@ impl<'b, 'l> Visitor<'b, 'l> for Dump {
 
         if self.exhausted() {
             while driver.skip_element()? {}
+            self.last_span = Span::new(start, driver.position());
             return Ok(DumpValue::DepthLimited { layout: format!("vector<{element}> (len {len})") });
         }
 
@@ -403,7 +405,8 @@ impl<'b, 'l> Visitor<'b, 'l> for Dump {
                 items.push(DumpItem { index: items.len(), span: inner.last_span, value });
                 rendered += 1;
                 if rendered == cap {
-                    // ponytail: stop decoding here; the rest is skipped at zero cost.
+                    // Stop producing values; the driver still walks the rest of the vector, it
+                    // just does not build anything for it.
                     while driver.skip_element()? {}
                     break;
                 }
@@ -471,5 +474,141 @@ impl<'b, 'l> Visitor<'b, 'l> for Dump {
 
         self.last_span = Span::new(start, driver.position());
         Ok(DumpValue::Variant { name, tag, fields })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use move_core_types::{
+        account_address::AccountAddress,
+        annotated_value::{MoveFieldLayout, MoveStructLayout, MoveTypeLayout},
+        identifier::Identifier,
+    };
+
+    use super::{Dump, DumpField, DumpOptions, DumpValue, Span};
+    use crate::visitor::decode_value;
+
+    /// `Outer { a: u64, items: vector<u64>, inner: Inner { x: u32, ys: vector<address> } }`, as
+    /// BCS: 8 bytes, a length-prefixed vector of two, a `u32`, and a length-prefixed vector of one.
+    fn bcs_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7_u64.to_le_bytes()); // a          [ 0.. 8)
+        bytes.push(2); // items length                              [ 8.. 9)
+        bytes.extend_from_slice(&1_u64.to_le_bytes()); //           [ 9..17)
+        bytes.extend_from_slice(&2_u64.to_le_bytes()); //           [17..25)
+        bytes.extend_from_slice(&9_u32.to_le_bytes()); // inner.x   [25..29)
+        bytes.push(1); // ys length                                 [29..30)
+        bytes.extend_from_slice(AccountAddress::new([0xab; 32]).as_ref()); // [30..62)
+        bytes
+    }
+
+    fn ident(text: &str) -> Identifier {
+        Identifier::new(text).unwrap_or_else(|_| unreachable!())
+    }
+
+    fn struct_layout(
+        module: &str,
+        name: &str,
+        fields: Vec<(&str, MoveTypeLayout)>,
+    ) -> MoveTypeLayout {
+        MoveTypeLayout::Struct(Box::new(MoveStructLayout {
+            type_: move_core_types::language_storage::StructTag {
+                address: AccountAddress::TWO,
+                module: ident(module),
+                name: ident(name),
+                type_params: vec![],
+            },
+            fields: fields
+                .into_iter()
+                .map(|(name, layout)| MoveFieldLayout { name: ident(name), layout })
+                .collect(),
+        }))
+    }
+
+    fn layout() -> MoveTypeLayout {
+        struct_layout(
+            "outer",
+            "Outer",
+            vec![
+                ("a", MoveTypeLayout::U64),
+                ("items", MoveTypeLayout::Vector(Box::new(MoveTypeLayout::U64))),
+                (
+                    "inner",
+                    struct_layout(
+                        "inner",
+                        "Inner",
+                        vec![
+                            ("x", MoveTypeLayout::U32),
+                            ("ys", MoveTypeLayout::Vector(Box::new(MoveTypeLayout::Address))),
+                        ],
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn field<'a>(value: &'a DumpValue, name: &str) -> &'a DumpField {
+        let DumpValue::Struct { fields, .. } = value else {
+            unreachable!("the root and `inner` are structs")
+        };
+        fields.iter().find(|field| field.name == name).unwrap_or_else(|| unreachable!())
+    }
+
+    /// Re-decode the recorded slice with the leaf's own layout and render it.
+    fn reread(bytes: &[u8], layout: &MoveTypeLayout, span: Span) -> String {
+        decode_value(&bytes[span.range()], layout, Dump::new())
+            .unwrap_or_else(|error| unreachable!("the slice must decode: {error}"))
+            .lines()
+            .join(" ")
+    }
+
+    #[test]
+    fn byte_ranges_slice_back_to_the_same_values() {
+        let bytes = bcs_bytes();
+        let layout = layout();
+        let dump = decode_value(&bytes, &layout, Dump::new())
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        assert_eq!(field(&dump, "a").span, Span::new(0, 8));
+        assert_eq!(
+            field(&dump, "items").span,
+            Span::new(8, 25),
+            "a vector's span covers its prefix"
+        );
+        assert_eq!(field(&dump, "inner").span, Span::new(25, 62));
+
+        let inner = field(&dump, "inner").value.clone();
+        assert_eq!(field(&inner, "x").span, Span::new(25, 29));
+        assert_eq!(field(&inner, "ys").span, Span::new(29, 62));
+
+        // Every leaf, re-decoded from its own recorded slice, must produce the same render — which
+        // is only true if the range is exactly the leaf's bytes.
+        let DumpValue::Vector { items, .. } = &field(&dump, "items").value else {
+            unreachable!("`items` is a vector")
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(reread(&bytes, &MoveTypeLayout::U64, items[0].span), "1  <u64>");
+        assert_eq!(reread(&bytes, &MoveTypeLayout::U64, items[1].span), "2  <u64>");
+        assert_eq!(reread(&bytes, &MoveTypeLayout::U32, field(&inner, "x").span), "9  <u32>");
+        let DumpValue::Vector { items, .. } = &field(&inner, "ys").value else {
+            unreachable!("`ys` is a vector")
+        };
+        assert_eq!(items[0].span.len(), 32, "an address is 32 bytes");
+        assert!(reread(&bytes, &MoveTypeLayout::Address, items[0].span).ends_with("<address>"));
+    }
+
+    #[test]
+    fn a_depth_limited_value_still_reports_its_own_span() {
+        // `inner.ys` sits exactly at the depth limit. Its span must still be its own, not the span
+        // of the sibling that was rendered before it.
+        let bytes = bcs_bytes();
+        let options = DumpOptions { max_depth: 2, max_items: 32 };
+        let dump = decode_value(&bytes, &layout(), Dump::with_options(options))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+
+        let inner = field(&dump, "inner").value.clone();
+        let ys = field(&inner, "ys");
+        assert_eq!(ys.span, Span::new(29, 62));
+        assert!(matches!(ys.value, DumpValue::DepthLimited { .. }));
     }
 }

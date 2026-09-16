@@ -30,8 +30,11 @@ struct Cli {
     #[arg(long, env = "BIRDAI_RPC_URL", default_value = constants::MAINNET_RPC, global = true)]
     rpc_url: String,
 
-    /// API key, sent as an `x-api-key` header. Needed by hosted providers that put the key in the
-    /// URL path, which a gRPC client cannot use.
+    /// API key for the gRPC object endpoint, sent as an `x-api-key` header. Needed by hosted
+    /// providers that put the key in the URL path, which a gRPC client cannot use.
+    ///
+    /// `follow` streams from `--rpc-url` and does not send it: the ingestion client upstream takes
+    /// a URL and no headers.
     #[arg(long, env = "BIRDAI_API_KEY", global = true)]
     api_key: Option<String>,
 
@@ -74,9 +77,10 @@ enum Command {
     Calibrate,
     /// Stream checkpoints and keep in-memory venue state current.
     Follow {
-        /// First checkpoint to apply.
-        #[arg(long, default_value_t = constants::TX_T_CHECKPOINT)]
-        from: u64,
+        /// First checkpoint to apply. Defaults to the node's latest, so a bare run follows live;
+        /// against a fixture set it defaults to the first captured checkpoint.
+        #[arg(long)]
+        from: Option<u64>,
         /// Stop after this many checkpoints that touched a venue.
         #[arg(long, default_value_t = 5)]
         count: u64,

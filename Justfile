@@ -11,7 +11,7 @@ format:
 # Auto-fix linting issues
 fix:
   rumdl check --fix .
-  RUSTC_WRAPPER= cargo +nightly clippy --fix --all --allow-dirty
+  RUSTC_WRAPPER= cargo +nightly clippy --fix --all --all-targets --allow-dirty
   cargo workspace-inheritance-check --fix
 
 # Run all lints
@@ -20,7 +20,7 @@ lint:
   rumdl check .
   cargo sort -w -g -c
   cargo +nightly fmt --all -- --check
-  RUSTC_WRAPPER= cargo +nightly clippy --all -- -D warnings
+  RUSTC_WRAPPER= cargo +nightly clippy --all --all-targets -- -D warnings
   cargo shear
   cargo workspace-inheritance-check
 

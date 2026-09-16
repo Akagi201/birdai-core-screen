@@ -28,9 +28,10 @@ pub use cetus::{
     CETUS_POOL_MODULE, CETUS_POOL_NAME, CetusClmm, CetusPoolDecoder, MAX_TICK_CROSSINGS,
 };
 pub use classify::{
-    Classifier, EntryEvidence, OracleDenySet, OracleReference, OracleVia, PriceStateChange, Probe,
-    StaticEvidence, SwapEntry, Verdict, coin_signatures, find_inter_asset_swap, held_asset,
-    price_state_change, referenced_types, scan_layout_for_oracles, scan_module_dependencies,
+    Classifier, EntryEvidence, OracleDenySet, OracleReference, OracleVia, PriceObservation,
+    PriceStateChange, Probe, StaticEvidence, SwapEntry, Verdict, coin_signatures,
+    find_inter_asset_swap, held_asset, price_state_change, referenced_types,
+    scan_layout_for_oracles, scan_module_dependencies,
 };
 pub use error::VenueError;
 pub use navi::{NAVI_STORAGE_MODULE, NAVI_STORAGE_NAME, NaviStorage};

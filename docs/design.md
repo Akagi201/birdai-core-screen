@@ -180,7 +180,9 @@ commit it explicitly).
 `sui-indexer-alt-framework` declares `default = ["cluster"]` → `cluster = ["postgres", "dep:tracing-subscriber"]`
 → `postgres = ["dep:sui-pg-db", "dep:diesel", "dep:diesel-async", "dep:diesel_migrations"]`. The Sui
 workspace itself pins it as `default-features = false`, so we do the same. The `ingestion` module is
-**not** feature-gated, so we keep the whole checkpoint ingestion stack and drop Diesel entirely.
+**not** feature-gated, so we keep the whole checkpoint ingestion stack. Diesel is *not* gone this way —
+`sui-indexer-alt-metrics` depends on `sui-pg-db` unconditionally (§14 item 18) — but nothing here
+touches a database at runtime, which is the part that matters.
 
 ### Build ergonomics (already in this repo, keep)
 
@@ -193,8 +195,10 @@ workspace itself pins it as `default-features = false`, so we do the same. The `
 ### Optional offline escape hatch
 
 Every number in the README is reproducible without network from a committed fixture set
-(`fixtures/objects/*.bcs`, `fixtures/layouts/*.json`, `fixtures/checkpoint-320577815.bin`), served by a
-`FixturePackageStore`/`FixtureObjectSource`. `cargo run -- … --offline` never touches a node. Committing a
+(`fixtures/objects.json`, `fixtures/packages.json`, `fixtures/layouts.json`, `fixtures/checkpoints.json`),
+served by `FixtureObjectSource`/`FixtureLayoutSource`. `cargo run -- --fixtures fixtures reproduce`
+never touches a node; `follow` replays the captured checkpoints through the same `apply_checkpoint`.
+Committing a
 full `cargo vendor` tree of the Sui dependency graph is deliberately **not** done (multi-GB); the first
 build requires network, which is normal for git dependencies and is called out in the README.
 
@@ -532,16 +536,19 @@ Read directly off `FunctionDef { visibility, is_entry, type_params, parameters: 
 and `OpenSignatureBody::TypeParameter(u16)`. Coin and balance are matched by address (`0x2`) as
 well as by name. No field-name heuristics, no registry, no ABI-string parsing.
 
-**(2) Endogenous price state (empirical, from two versions).** `O` carries a numeric state variable (or
-tuple) whose value is a pure function of `O`'s own fields, and that variable **moves monotonically with net
-trade flow**: given two versions of `O` bracketing a transaction that used the entry from (1), the price
-variable moved in the direction implied by the flow, and **no oracle object appears among that
-transaction's input objects**.
+**(2) Endogenous price state.** `O` must carry a price variable its own fields determine. The typed
+venues make that checkable: `Venue::price_state()` returns the pool's `(√P, L, tick)` and `None` for
+the vault and the ledger, so "this object has no price variable" is a decoded fact rather than an
+impression. Where two versions of `O` bracket a transaction that used the entry from (1), the probe
+additionally requires the variable to **move with net flow** — B in must raise `√P`, A in must lower
+it — and vetoes the probe when an oracle-shaped object is among the transaction's inputs.
 
-**(3) No-oracle probe (static).** Neither `T`'s field types nor the parameter types of the entry found in
-(1) reference an external price feed: we scan `Module::bytecode()`'s immediate `module_handles` and the
-`DataDef` field types for a configured deny-set of oracle packages/modules (`pyth`, `supra`, `switchboard`,
-and each vendor's local `oracle`/`price_oracle` module).
+**(3) No imported price (static).** Neither `T`'s field types, nor the modules the defining package
+links (`Module::bytecode()`'s immediate `module_handles`), nor the rendered signature of the entry
+found in (1) may reference an external price feed. "Reference" means a match against a configured
+deny-set: name fragments (`oracle`, `pyth`, `supra`, `switchboard`, `price_feed`, `price_info`) plus
+explicit package addresses. This is a dependency heuristic, not a completeness proof — a feed linked
+under an unrelated module name evades it, which is why the deny set also takes addresses.
 
 (1) and (3) are static and cheap; (2) is what separates "has a price field" from "discovers a price".
 
@@ -576,19 +583,26 @@ against a share claim. Probe (2) fails. Probe (3) trips: oracle dependency. **Fa
 ### 6.3 Implementation
 
 ```rust
-pub struct Classifier<L: LayoutSource> { layouts: Arc<L>, oracle_deny: OracleDenySet }
+pub struct Classifier { deny: OracleDenySet }
 
-impl<L: LayoutSource> Classifier<L> {
-    pub fn static_probe(&self, tag: &StructTag, layout: &MoveTypeLayout) -> Result<StaticEvidence>;
-    pub fn price_state_probe(&self, before: &Object, after: &Object, tx: &CheckpointTransaction)
-        -> Result<DynamicEvidence>;
-    pub fn verdict(&self, ev: &[Evidence]) -> Verdict;   // is_venue + per-probe evidence
+impl Classifier {
+    pub async fn static_evidence<L: LayoutSource + ?Sized>(&self, layouts: &L, tag: &StructTag)
+        -> Result<StaticEvidence, VenueError>;
+    pub async fn entry_at<L: LayoutSource + ?Sized>(&self, layouts: &L, venue: &StructTag,
+        package: AccountAddress, module: &str, function: &str)
+        -> Result<Option<SwapEntry>, VenueError>;
+    pub fn verdict(&self, tag: &StructTag, evidence: &StaticEvidence,
+        observation: PriceObservation<'_>, observed: Option<&SwapEntry>) -> Verdict;
 }
 ```
 
-The CLI prints the matching `FunctionDef` (name, visibility, entry-ness, parameter and return signatures)
-and the before/after price values, so the README's paragraphs are **backed by printed evidence**, not
-assertion. `Evidence` is a plain enum, and `Verdict` carries `is_venue: bool` plus the reason per probe.
+`StaticEvidence` carries the swap entry, the oracle references, the number of functions examined and
+the coin-touching signatures considered, so a failing probe can be audited line by line.
+`PriceObservation` distinguishes "a transaction was observed" from "the object has no price variable"
+from "has one, but nothing was observed", which is what makes clause (2) say something precise about
+B and C. The CLI prints the matching `FunctionDef` (name, visibility, entry-ness, parameter and
+return signatures) and the before/after price values, so the README's paragraphs are **backed by
+printed evidence**, not assertion.
 
 ---
 
@@ -646,9 +660,11 @@ multiplication and whose `checked_div` is exact. The final downcast uses `TryFro
 
 **Guard rail.** `U256`'s `Add`/`Sub`/`Mul`/`Div` operator impls are **wrapping** (documented "Ignores
 overflows"), and `Div` panics on a zero divisor. `birdai-amm` therefore defines
-`struct CheckedU256(U256)` exposing only `checked_*` operations and a `TryFrom<u128>`/`Into<u128>` pair, and
-a `clippy::disallowed_methods` entry forbids operator use on `U256` inside the crate. Arithmetic failures
-surface as `AmmError::{Overflow, DivByZero, ZeroLiquidity}`, never as a silent wrap.
+`struct CheckedU256(U256)` exposing only `checked_*` operations and a `TryFrom<u128>`/`Into<u128>` pair,
+and all arithmetic in the pricing crates goes through it — the operators are named only inside
+`CheckedU256` itself and in tests, which is the enforcement (a `clippy.toml` `disallowed-methods`
+entry was considered and dropped as redundant with that). Arithmetic failures surface as
+`AmmError::{Overflow, DivByZero, ZeroLiquidity}`, never as a silent wrap.
 
 `L == 0` and `S == 0` are rejected explicitly (`ZeroLiquidity` / `InvalidSqrtPrice`) rather than aborting
 for the same reason the Move code would.
@@ -754,15 +770,18 @@ define their own `pool::Pool`.
 look like children at all in the change set. The manager routes them by
 `Owner::ObjectOwner(parent)` and indexes **only the inner UIDs of tracked Cetus pools** — a
 lending ledger's ~999k user entries are never indexed at all — with each parent's set bounded by
-a capacity whose drops are counted and warned, not silent. A deleted parent's entries die with it.
-Tick nodes are dense enough (hundreds) to index fully, which is what makes tick-range pricing
-O(log n).
+a capacity whose drops are counted and warned, not silent. Removals are routed back through a
+child→owner map: a deleted pool drops the set keyed by its inner UID (not by its own id), and a
+deleted child leaves its parent's set. Tick nodes are dense enough (hundreds) to index fully; the
+index is what the follower reports, while pricing ranges over the tick-ordered map built from the
+loaded nodes rather than over the links.
 
 The skip list's declared `size` is used **only as a consistency signal**: `Ticks::new` (same-state
 reads) asserts it, while `Ticks::from_children` (children read at the present against historical
 metadata) downgrades a mismatch to a reported `SizeSkew`, because dynamic fields can only be
-listed as of now. A mismatch is reported rather than hidden, because a drifted child index is the
-failure mode that silently misprices everything downstream.
+listed as of now. `StateManager::install_ticks` uses the latter and returns the skew, because the
+nodes it is handed are always read as of now. A mismatch is reported rather than hidden, because a
+drifted child index is the failure mode that silently misprices everything downstream.
 
 **Package upgrades that change layouts.** This is the gap `PackageStoreWithLruCache` does not close: it
 caches `Package` by storage id and re-fetches on demand, but it has **no invalidation hook**, so a cached
@@ -855,7 +874,7 @@ in, typed state out) and the **quality of the on-chain research** (§1) — incl
 
 ## 10. Testing
 
-117 tests, all offline against the committed fixture set (`cargo test` never touches the network):
+137 tests, all offline against the committed fixture set (`cargo test` never touches the network):
 
 * **Golden fixtures** — A, B, C, the tick children and checkpoint `320577815`'s kept transactions:
   bytes + layout + expected field dump with offsets.
@@ -959,7 +978,7 @@ plausible one.
 | 14 | §8.3 | Venue identity is by `module::name`, so a new pool is picked up automatically. | Name alone is not identity: `follow` met 27 objects named `pool::Pool` from other packages with different layouts and failed to decode every one of them. | The name is a hint and the **resolved layout's field set** is the test (`layout_has_shape`). Collisions are counted as `unrecognised`, distinct from `failures`. |
 | 15 | §5.5, §8.3 | Children are re-associated with parents and the declared `size` is asserted. | A pool's children **cannot be read at a historical version**. T consumed pool A at version 995 150 484, which declares 650 ticks; enumerating today returns 653. | `Ticks::from_children` downgrades the size check to a reported `SizeSkew` while keeping every other invariant, and callers must handle the skew. See item 17 for why the quote does not need the tick set at all. |
 | 16 | §7.2, §7.4 | `sqrt_price_at_tick` is `⌊1.0001^(t/2)·2^64⌋` and tick nodes can be validated against it exactly. | Two of pool A's 654 nodes differ, by up to 7 units at `√P ≈ 7.9·10^28` (relative error under `2^-90`). Exhaustive search over Q128.128 with floor/round/ceil factor tables, truncating or ceiling the final narrowing, and an integer-square-root variant found **no** variant that reproduces every observed tick. | The on-chain values are authoritative; `sqrt_price_at_tick` is documented as approximate and validation uses a **relative** tolerance (`TICK_PRICE_TOLERANCE_BITS = 48`) with the deviation histogram reported. The swap math already used stored prices, so the reproduction was unaffected. |
-| 17 | §6.5 | The single step is proven by comparing `S'` against the next initialised tick. | That comparison needs the tick set, which item 15 shows is unavailable at a historical version. | The primary argument is now `tick_spacing`: a price move smaller than the spacing cannot reach another initialised tick, because initialised ticks lie on the spacing grid. `reproduce` quotes both with and without boundaries and asserts they agree. |
+| 17 | §6.5 | The single step is proven by comparing `S'` against the next initialised tick. | That comparison needs the tick set, which item 15 shows is unavailable at a historical version. | The primary argument is the **floor tick**: the reached price maps back to the same tick index as the starting price, and initialised ticks sit on the spacing grid, so no boundary lies between the two prices — no tick set needed. (`tick_spacing` alone is *not* sufficient: from tick 71 162 the next multiple of 10 is 71 170, eight ticks away, so a nine-tick move would cross a boundary that a "less than the spacing" test calls safe.) `reproduce` prints both that test and the live bracket, and asserts the quote agrees with and without boundaries. |
 | 18 | §2.2 | `default-features = false` on `sui-indexer-alt-framework` drops Diesel/Postgres. | It does not. `sui-indexer-alt-metrics` — a non-optional dependency of the framework — depends on `sui-pg-db` unconditionally, so Diesel, `diesel-async`, `diesel_migrations` and `tokio-postgres` are in the graph regardless. | The framework is still right, because nothing else ships hybrid streaming + backfill with retries and backpressure. The claim is corrected; the flag is kept because Sui's own root uses it. |
 | 19 | §7.3 | The CLMM math needs care around `U256`'s semantics. | `U256`'s `Add`/`Sub`/`Mul` **wrap** and `Div`/`Rem` panic on a zero divisor; the `checked_*` variants exist but nothing forces their use. | Arithmetic goes through a `CheckedU256` newtype that exposes only checked operations and converts failures into `AmmError`; it is the only way the crate touches a 256-bit value. |
 | 20 | §10 | Tests cover the golden numbers. | Three test *expectations* were wrong on first run: a rounding bound that ignored the magnitude of the truncated factors, a `nearest` tie point miscalculated, and a crossing case whose input was large enough to overflow. All three were fixed against measured data, not loosened. | The values that actually hold are recorded in the tests' comments. |

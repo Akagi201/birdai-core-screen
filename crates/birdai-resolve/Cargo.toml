@@ -13,6 +13,7 @@ bcs.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 move-core-types.workspace = true
+scc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sui-package-resolver.workspace = true

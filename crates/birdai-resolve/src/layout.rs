@@ -14,7 +14,6 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    hash::BuildHasher,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -37,6 +36,63 @@ use crate::error::ResolveError;
 /// Recorded next to published state so a checkpoint replay can assert it decoded with the same
 /// layout that was live at the time.
 pub type Fingerprint = [u8; 32];
+
+/// The package versions a checkpoint has named, keyed by the package a layout would reference.
+///
+/// One tracker, shared by the two caches that have to react to an upgrade: the layout cache drops
+/// a resolved layout, and the package store drops the bytecode it was resolved from. Both ask the
+/// same question — "is what I recorded still the version the chain is on?" — so both read the same
+/// answers.
+///
+/// Cloning is cheap: the inner map is behind an [`ArcSwap`].
+#[derive(Debug, Clone, Default)]
+pub struct PackageVersions(Arc<ArcSwap<HashMap<AccountAddress, u64>>>);
+
+impl PackageVersions {
+    /// A tracker with nothing observed yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record observations. Versions only move forwards: a checkpoint that names an older package
+    /// object than one already seen cannot make cached data fresh again.
+    pub fn observe(&self, versions: &[(AccountAddress, u64)]) {
+        if versions.is_empty() {
+            return;
+        }
+        self.0.rcu(|current| {
+            let mut next = (**current).clone();
+            for &(address, version) in versions {
+                next.entry(address)
+                    .and_modify(|seen| *seen = (*seen).max(version))
+                    .or_insert(version);
+            }
+            Arc::new(next)
+        });
+    }
+
+    /// The version believed live for `address`; `0` when nothing has been observed for it.
+    #[must_use]
+    pub fn live(&self, address: &AccountAddress) -> u64 {
+        self.0.load().get(address).copied().unwrap_or(0)
+    }
+
+    /// True when a value recorded at `version` has not been superseded.
+    ///
+    /// An unobserved package reads as version `0`, so a value recorded against it goes stale the
+    /// first time any version is seen for it — the safe direction.
+    #[must_use]
+    pub fn is_current(&self, address: &AccountAddress, version: u64) -> bool {
+        self.live(address) <= version
+    }
+
+    /// The versions currently believed to be live, for reporting.
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<AccountAddress, u64> {
+        (**self.0.load()).clone()
+    }
+}
 
 /// Where layouts come from.
 #[async_trait]
@@ -98,23 +154,37 @@ pub struct CacheStats {
 pub struct LayoutRegistry<S> {
     resolver: Arc<Resolver<S>>,
     cache: ArcSwap<HashMap<StructTag, Arc<CachedLayout>>>,
-    packages: ArcSwap<HashMap<AccountAddress, u64>>,
+    packages: PackageVersions,
     hits: AtomicU64,
     misses: AtomicU64,
     invalidated: AtomicU64,
 }
 
 impl<S> LayoutRegistry<S> {
-    /// Wrap a resolver.
+    /// Wrap a resolver, tracking package versions privately.
     pub fn new(resolver: Arc<Resolver<S>>) -> Self {
+        Self::with_versions(resolver, PackageVersions::new())
+    }
+
+    /// Wrap a resolver, sharing the version tracker with the package store underneath it.
+    ///
+    /// Sharing is the point: the store cannot know a package moved unless it is told what the
+    /// checkpoints said, and the registry is where those observations arrive.
+    pub fn with_versions(resolver: Arc<Resolver<S>>, packages: PackageVersions) -> Self {
         Self {
             resolver,
             cache: ArcSwap::from_pointee(HashMap::new()),
-            packages: ArcSwap::from_pointee(HashMap::new()),
+            packages,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             invalidated: AtomicU64::new(0),
         }
+    }
+
+    /// The shared package-version tracker, for a store that wants to invalidate with it.
+    #[must_use]
+    pub fn package_versions_handle(&self) -> PackageVersions {
+        self.packages.clone()
     }
 
     /// The underlying resolver, for callers that need bytecode.
@@ -141,17 +211,17 @@ impl<S> LayoutRegistry<S> {
     #[must_use]
     pub fn fingerprint(&self, tag: &StructTag) -> Option<Fingerprint> {
         let entry = self.cache.load().get(tag).cloned()?;
-        let live = self.packages.load();
-        let stale =
-            entry.dependencies.iter().any(|(address, version)| is_newer(&live, address, *version));
+        let stale = entry
+            .dependencies
+            .iter()
+            .any(|(address, version)| !self.packages.is_current(address, *version));
         if stale { None } else { Some(entry.fingerprint) }
     }
 
     /// The versions currently believed to be live for each tracked package.
     #[must_use]
     pub fn package_versions(&self) -> HashMap<AccountAddress, u64> {
-        let guard = self.packages.load();
-        (**guard).clone()
+        self.packages.snapshot()
     }
 
     /// Every layout currently cached, with the tag it was resolved for.
@@ -181,40 +251,22 @@ impl<S> LayoutRegistry<S> {
             return;
         }
 
-        self.packages.rcu(|current| {
-            let mut next = (**current).clone();
-            for &(address, version) in versions {
-                next.entry(address)
-                    .and_modify(|seen| *seen = (*seen).max(version))
-                    .or_insert(version);
-            }
-            Arc::new(next)
-        });
+        self.packages.observe(versions);
 
-        let live = self.packages.load();
+        let stale = |entry: &Arc<CachedLayout>| {
+            entry
+                .dependencies
+                .iter()
+                .any(|(address, version)| !self.packages.is_current(address, *version))
+        };
         // Count the stale entries from the snapshot, then remove by key: `rcu` retries its
         // closure under contention, so counting inside it would double-count. The count is
         // approximate if another thread mutates the cache concurrently, which is fine for a
         // metric — eviction itself still removes every stale entry the closure sees.
-        let dropped = self
-            .cache
-            .load()
-            .values()
-            .filter(|entry| {
-                entry
-                    .dependencies
-                    .iter()
-                    .any(|(address, version)| is_newer(&live, address, *version))
-            })
-            .count() as u64;
+        let dropped = self.cache.load().values().filter(|entry| stale(entry)).count() as u64;
         self.cache.rcu(|current| {
             let mut next = (**current).clone();
-            next.retain(|_, entry| {
-                !entry
-                    .dependencies
-                    .iter()
-                    .any(|(address, version)| is_newer(&live, address, *version))
-            });
+            next.retain(|_, entry| !stale(entry));
             Arc::new(next)
         });
         self.invalidated.fetch_add(dropped, Ordering::Relaxed);
@@ -228,14 +280,6 @@ impl<S> LayoutRegistry<S> {
             Arc::new(next)
         });
     }
-}
-
-fn is_newer<S: BuildHasher>(
-    live: &HashMap<AccountAddress, u64, S>,
-    address: &AccountAddress,
-    version: u64,
-) -> bool {
-    live.get(address).is_some_and(|current| *current > version)
 }
 
 /// Every package a `StructTag` mentions, including generic type parameters.
@@ -263,11 +307,10 @@ impl<S: PackageStore> LayoutSource for LayoutRegistry<S> {
         {
             let cache = self.cache.load();
             if let Some(entry) = cache.get(&canonical) {
-                let live = self.packages.load();
                 let stale = entry
                     .dependencies
                     .iter()
-                    .any(|(address, version)| is_newer(&live, address, *version));
+                    .any(|(address, version)| !self.packages.is_current(address, *version));
                 if !stale {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(entry.layout.clone());
@@ -281,7 +324,7 @@ impl<S: PackageStore> LayoutSource for LayoutRegistry<S> {
                 |source| ResolveError::Layout { tag: canonical.to_canonical_string(true), source },
             )?;
 
-        let dependencies = collect_dependencies(&layout, &self.packages.load());
+        let dependencies = collect_dependencies(&layout, &self.packages);
         let fingerprint = fingerprint(&layout);
         let layout = Arc::new(layout);
 
@@ -331,9 +374,9 @@ impl<S: PackageStore> LayoutSource for LayoutRegistry<S> {
 /// A package with no recorded version is stored as `0`, meaning "not yet observed"; the layout is
 /// then treated as stale the first time a version for it is seen, which is the safe direction.
 #[must_use]
-pub fn collect_dependencies<S: BuildHasher>(
+pub fn collect_dependencies(
     layout: &MoveTypeLayout,
-    live: &HashMap<AccountAddress, u64, S>,
+    live: &PackageVersions,
 ) -> Vec<(AccountAddress, u64)> {
     let mut addresses = BTreeSet::new();
     visit(layout, &mut |node| {
@@ -343,10 +386,7 @@ pub fn collect_dependencies<S: BuildHasher>(
             collect_tag_addresses(&inner.type_, &mut addresses);
         }
     });
-    addresses
-        .into_iter()
-        .map(|address| (address, live.get(&address).copied().unwrap_or(0)))
-        .collect()
+    addresses.into_iter().map(|address| (address, live.live(&address))).collect()
 }
 
 /// Hash a layout into a stable fingerprint.

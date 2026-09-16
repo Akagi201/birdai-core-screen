@@ -5,18 +5,22 @@
 //! An object `O` of type `T` is a trading venue with on-chain price discovery **iff** all three
 //! probes pass.
 //!
-//! 1. **Inter-asset swap entry** *(static, from package bytecode)*. The module defining `T` must
-//!    expose a public (or entry) function that takes `&mut T` together with a
-//!    `Coin<X>`/`Balance<X>` and returns a `Coin<Y>`/`Balance<Y>`, where `X` and `Y` are **two
-//!    different type parameters of `T`**. Nothing about field names or about "having balances"
+//! 1. **Inter-asset swap entry** *(static, from package bytecode)*. Some public (or entry) function
+//!    must **mutably borrow the venue itself** — `&mut T<…>` — and carry asset legs on **two
+//!    different type parameters of that borrow**, i.e. a `Coin<X>`/`Balance<X>` leg and a
+//!    `Coin<Y>`/`Balance<Y>` leg with `X ≠ Y`. Nothing about field names or about "having balances"
 //!    enters here: the probe reads [`FunctionDef`] signatures, so a vault with two `Balance` fields
 //!    and no inter-asset swap fails it immediately.
-//! 2. **Endogenous price state** *(empirical, from two versions)*. `O` must carry a price variable
-//!    that is a pure function of its own fields, and that variable must **move with net flow**:
-//!    across a transaction that used the entry found in (1), it moved in the direction the flow
-//!    implies, and no oracle object was among that transaction's inputs.
-//! 3. **No oracle dependency** *(static)*. Neither `T`'s field types nor the defining module's
-//!    dependencies may reference an external price feed.
+//! 2. **Endogenous price state.** `O` must carry a price variable that is a function of its own
+//!    fields. An object whose decoded state has no price variable at all fails here outright. Where
+//!    a transaction that used the entry from (1) is available, that variable must also **move with
+//!    net flow**: it moved in the direction the flow implies, and no oracle object was among that
+//!    transaction's inputs.
+//! 3. **No imported price** *(static)*. The defining package's linked modules, the object's field
+//!    types and the entry's signature are scanned for price-feed names (`oracle`, `pyth`, `supra`,
+//!    `switchboard`, `price_feed`, `price_info`) and for packages on an explicit deny list. This
+//!    one is a name heuristic on purpose: a module named something else can import prices without
+//!    tripping it, which is why `OracleDenySet` also takes package addresses.
 //!
 //! Probe (1) is what distinguishes a venue from a vault; probe (2) is what distinguishes "has a
 //! price field" from "discovers a price"; probe (3) is what distinguishes price discovery from
@@ -43,7 +47,9 @@ use crate::{cetus::CetusClmm, error::VenueError, venue::PriceState};
 /// Module-name fragments that mean "this package imports prices from outside".
 ///
 /// This is a *dependency* heuristic, not a field-name one: it is applied to the modules a package
-/// links against, and a venue that discovered its own prices would not link an oracle at all.
+/// links against, and a venue that discovered its own prices would not link an oracle at all. It is
+/// incomplete by nature — a feed linked under an unrelated module name slips through — so
+/// [`OracleDenySet`] also accepts package addresses for the cases that are known exactly.
 const ORACLE_NAME_FRAGMENTS: &[&str] =
     &["oracle", "pyth", "supra", "switchboard", "price_feed", "price_info"];
 
@@ -108,10 +114,22 @@ pub enum EntryEvidence {
     StaticScan,
     /// A function the chain actually executed, resolved by its `package::module::function`.
     ///
-    /// Direct evidence, so a looser shape test is warranted: script-style entries such as Cetus's
-    /// `pool_script_v2::swap_b2a` take both coins and write the result into one of them, so the
-    /// input/output split lives in a `bool` direction flag rather than in the types.
+    /// Direct evidence, so the coin legs do not have to express the direction: script-style entries
+    /// such as Cetus's `pool_script_v2::swap_b2a` take both coins and write the result into one of
+    /// them, so which asset goes in lives in a `bool` flag rather than in the types. The venue
+    /// borrow itself is required either way.
     ObservedCall,
+}
+
+/// What the behavioural probe had to work with.
+#[derive(Debug, Clone, Copy)]
+pub enum PriceObservation<'a> {
+    /// A transaction that used the entry from probe 1 was available.
+    Observed(&'a PriceStateChange),
+    /// The object's own decoded state carries no price variable, so there is nothing to move.
+    NoPriceVariable,
+    /// The object has a price variable, but no transaction using it was available.
+    NoTransaction,
 }
 
 /// The function that lets two assets be exchanged, as read from bytecode.
@@ -375,15 +393,17 @@ impl Classifier {
         })
     }
 
-    /// Resolve a function the chain actually called and test whether it has the swap shape.
+    /// Resolve a function the chain actually called and test whether it swaps `venue`'s assets.
     ///
     /// The defining package is not always where the entry lives: a mainnet Cetus swap of pool A
     /// went through `pool_script_v2::swap_b2a`, a sibling package that borrows the pool and moves
     /// its two assets. Testing the signature of the function the chain *did* call is stronger
-    /// evidence than scanning for a shape somebody might have written.
+    /// evidence than scanning for a shape somebody might have written — but the function still has
+    /// to take a mutable borrow of *this* venue, or it is some other pool's business.
     pub async fn entry_at<L: LayoutSource + ?Sized>(
         &self,
         layouts: &L,
+        venue: &StructTag,
         package: AccountAddress,
         module: &str,
         function: &str,
@@ -408,10 +428,16 @@ impl Classifier {
         if !is_callable(&definition) {
             return Ok(None);
         }
-        Ok(swap_shape(resolved.name(), function, &definition, EntryEvidence::ObservedCall, None))
+        Ok(swap_shape(
+            resolved.name(),
+            function,
+            &definition,
+            EntryEvidence::ObservedCall,
+            Some(venue),
+        ))
     }
 
-    /// Turn static evidence, plus an optional observed price move, into a verdict.
+    /// Turn static evidence, plus what the behavioural probe saw, into a verdict.
     ///
     /// `observed` is the entry the chain actually executed, when a transaction is available. It
     /// takes precedence over the static scan because it is direct evidence rather than a search.
@@ -420,7 +446,7 @@ impl Classifier {
         &self,
         tag: &StructTag,
         evidence: &StaticEvidence,
-        change: Option<&PriceStateChange>,
+        observation: PriceObservation<'_>,
         observed: Option<&SwapEntry>,
     ) -> Verdict {
         let mut probes = Vec::with_capacity(3);
@@ -440,10 +466,13 @@ impl Classifier {
                 ),
             )
         } else {
+            // The count is over the whole defining package, not just the type's own module: the
+            // entry that moves a pool is frequently in a sibling module, so the scan has to be.
             let mut detail = format!(
-                "none of the {} functions in `{}` exchanges one of the type's own coin \
-                 parameters for another with a `&mut` borrow of the object",
-                evidence.functions_examined, tag.module
+                "none of the {} functions in the package defining {} exchanges one of the type's \
+                 own coin parameters for another with a `&mut` borrow of the object",
+                evidence.functions_examined,
+                short_tag(tag)
             );
             if evidence.coin_functions.is_empty() {
                 detail.push_str("; no callable function mentions a Coin or a Balance at all");
@@ -455,9 +484,15 @@ impl Classifier {
         };
         probes.push(Probe { name: "inter-asset swap entry", passed, detail });
 
-        let (passed, detail) = match change {
-            Some(change) => (change.is_endogenous(), change.explain()),
-            None => (
+        let (passed, detail) = match observation {
+            PriceObservation::Observed(change) => (change.is_endogenous(), change.explain()),
+            PriceObservation::NoPriceVariable => (
+                false,
+                "the object's own state carries no price variable at all, so nothing in it can be \
+                 discovered by trading"
+                    .to_owned(),
+            ),
+            PriceObservation::NoTransaction => (
                 false,
                 "no transaction observed for this object, so the price state could not be \
                  checked against flow"
@@ -467,7 +502,14 @@ impl Classifier {
         probes.push(Probe { name: "endogenous price state", passed, detail });
 
         let (passed, detail) = if evidence.oracle_references.is_empty() {
-            (true, "no oracle dependency found".to_owned())
+            (
+                true,
+                format!(
+                    "no linked module, field type or entry signature names a price feed \
+                     (scanned for {})",
+                    self.deny.fragments.join(", ")
+                ),
+            )
         } else {
             (
                 false,
@@ -489,11 +531,15 @@ impl Classifier {
         Verdict { tag: short_tag(tag), probes }
     }
 
-    /// Classify an object end to end, including the behavioural probe when a transaction is given.
+    /// Classify an object end to end.
+    ///
+    /// `price_state` is the object's own price variable, as the venue decoder saw it — the
+    /// behavioural probe needs it to tell "no price to discover" apart from "not observed".
     pub async fn classify_object<L: LayoutSource + ?Sized>(
         &self,
         layouts: &L,
         object: &Object,
+        price_state: Option<PriceState>,
         change: Option<&PriceStateChange>,
         observed: Option<&SwapEntry>,
     ) -> Result<Verdict, VenueError> {
@@ -501,12 +547,17 @@ impl Classifier {
             .struct_tag()
             .ok_or_else(|| VenueError::NoTypeTag(object.id().to_canonical_string(true)))?;
         let evidence = self.static_evidence(layouts, &tag).await?;
-        Ok(self.verdict(&tag, &evidence, change, observed))
+        let observation = match (change, price_state) {
+            (Some(change), _) => PriceObservation::Observed(change),
+            (None, None) => PriceObservation::NoPriceVariable,
+            (None, Some(_)) => PriceObservation::NoTransaction,
+        };
+        Ok(self.verdict(&tag, &evidence, observation, observed))
     }
 }
 
-/// Probe 1: find a public/entry function that swaps one of the object's own coin parameters for
-/// another, with a mutable borrow of the object itself.
+/// Probe 1: find a public/entry function that swaps two of the venue's own type parameters for
+/// each other, with a mutable borrow of the venue itself.
 ///
 /// Matching is entirely on `FunctionDef` structure — `OpenSignatureBody::Datatype` for the coin
 /// types and `OpenSignatureBody::TypeParameter` for the flows — so it cannot be satisfied by
@@ -549,19 +600,23 @@ fn swap_shape(
     // a registry, a factory, a capability, a lending ledger — cannot be trading the object's assets
     // for each other. This one clause rejects Volo's `stake`/`unstake` and every Navi entry,
     // because neither `NativePool` nor `Storage` has a type parameter.
-    // ponytail: for static scans the borrow must name the venue itself, not any generic.
-    let mutates_generic_state = definition.parameters.iter().any(|parameter| {
-        if let Some(venue) = venue.filter(|_| evidence == EntryEvidence::StaticScan) {
-            is_mutable_venue_reference(&parameter.body, parameter.ref_, venue)
-        } else {
-            is_mutable_generic_reference(&parameter.body, parameter.ref_)
-        }
-    });
-    if !mutates_generic_state {
+    let venue = venue?;
+    let mut borrowed: Vec<u16> = definition
+        .parameters
+        .iter()
+        .filter_map(|parameter| mutable_venue_borrow(&parameter.body, parameter.ref_, venue))
+        .flatten()
+        .collect();
+    borrowed.sort_unstable();
+    borrowed.dedup();
+    if borrowed.is_empty() {
         return None;
     }
 
-    // Every type parameter that carries an asset leg, on either side.
+    // Every type parameter of that borrow that carries an asset leg, on either side. Tying the
+    // legs to the borrow is what makes this "the venue's own assets": a function that borrows
+    // `&mut Pool<A, B>` and moves `Coin<X>` into `Coin<Y>` for unrelated `X`/`Y` is not a swap of
+    // this pool's assets for each other.
     let mut asset_type_parameters: Vec<u16> = definition
         .parameters
         .iter()
@@ -569,6 +624,7 @@ fn swap_shape(
         .chain(
             definition.return_.iter().filter_map(|returned| asset_type_parameter(&returned.body)),
         )
+        .filter(|index| borrowed.contains(index))
         .collect();
     asset_type_parameters.sort_unstable();
     asset_type_parameters.dedup();
@@ -585,11 +641,13 @@ fn swap_shape(
             .parameters
             .iter()
             .filter_map(|parameter| coin_input_type_parameter(&parameter.body))
+            .filter(|index| borrowed.contains(index))
             .collect();
         let outputs: Vec<u16> = definition
             .return_
             .iter()
             .filter_map(|returned| asset_type_parameter(&returned.body))
+            .filter(|index| borrowed.contains(index))
             .collect();
         if !inputs.iter().any(|input| outputs.iter().any(|output| output != input)) {
             return None;
@@ -607,38 +665,35 @@ fn swap_shape(
     })
 }
 
-/// True when this is a `&mut D<…, TypeParameter, …>` — a mutable borrow of a generic struct.
-fn is_mutable_generic_reference(body: &OpenSignatureBody, reference: Option<Reference>) -> bool {
-    if !matches!(reference, Some(Reference::Mutable)) {
-        return false;
-    }
-    match body {
-        OpenSignatureBody::Datatype(_, arguments) => {
-            arguments.iter().any(|argument| matches!(argument, OpenSignatureBody::TypeParameter(_)))
-        }
-        _ => false,
-    }
-}
-
-/// True when this is a `&mut Venue<…, TypeParameter, …>` — a mutable borrow of the venue itself.
-fn is_mutable_venue_reference(
+/// The type-parameter indices of a `&mut Venue<…>` borrow, if this parameter is one.
+///
+/// `None` for anything that is not a mutable borrow of exactly this venue type: another struct,
+/// another module, a shared borrow, or a borrow with no type parameter to trade.
+fn mutable_venue_borrow(
     body: &OpenSignatureBody,
     reference: Option<Reference>,
     venue: &StructTag,
-) -> bool {
+) -> Option<Vec<u16>> {
     if !matches!(reference, Some(Reference::Mutable)) {
-        return false;
+        return None;
     }
     let OpenSignatureBody::Datatype(key, arguments) = body else {
-        return false;
+        return None;
     };
     if key.package != venue.address ||
         key.module.as_ref() != venue.module.as_str() ||
         key.name.as_ref() != venue.name.as_str()
     {
-        return false;
+        return None;
     }
-    arguments.iter().any(|argument| matches!(argument, OpenSignatureBody::TypeParameter(_)))
+    let parameters: Vec<u16> = arguments
+        .iter()
+        .filter_map(|argument| match argument {
+            OpenSignatureBody::TypeParameter(index) => Some(*index),
+            _ => None,
+        })
+        .collect();
+    (!parameters.is_empty()).then_some(parameters)
 }
 
 /// The type parameter inside `Coin<T>` or `Balance<T>`, in any position or reference mode.
@@ -994,5 +1049,178 @@ mod tests {
         assert!(reference_from_text("&mut HistoracleToken<T0>", &deny).is_none());
         assert!(reference_from_text("0x2::price_oracle::PriceOracle", &deny).is_some());
         assert!(reference_from_text("0x2::coin::Coin<T0>", &deny).is_none());
+    }
+
+    // --- probe 1, against hand-built `FunctionDef`s ------------------------------------------
+
+    use move_binary_format::file_format::Visibility;
+    use sui_package_resolver::{
+        DatatypeKey, FunctionDef, OpenSignature, OpenSignatureBody, Reference,
+    };
+
+    use super::{Classifier, EntryEvidence, PriceObservation, StaticEvidence, swap_shape};
+
+    /// The venue every borrow has to name.
+    fn venue() -> StructTag {
+        StructTag {
+            address: AccountAddress::new([0x1e; 32]),
+            module: ident("pool"),
+            name: ident("Pool"),
+            type_params: vec![],
+        }
+    }
+
+    /// `0x2::<module>::<name><T<index>>`, as bytecode renders an asset leg.
+    fn coin(module: &str, name: &str, index: u16) -> OpenSignatureBody {
+        OpenSignatureBody::Datatype(
+            DatatypeKey {
+                package: AccountAddress::TWO,
+                module: module.to_owned().into(),
+                name: name.to_owned().into(),
+            },
+            vec![OpenSignatureBody::TypeParameter(index)],
+        )
+    }
+
+    /// A key with owned strings, for the places a `DatatypeKey` is built from a literal.
+    fn key(package: AccountAddress, module: &str, name: &str) -> DatatypeKey {
+        DatatypeKey { package, module: module.to_owned().into(), name: name.to_owned().into() }
+    }
+
+    fn parameter(body: OpenSignatureBody, reference: Option<Reference>) -> OpenSignature {
+        OpenSignature { ref_: reference, body }
+    }
+
+    /// `&mut Pool<T0, T1>`.
+    fn venue_borrow() -> OpenSignature {
+        parameter(
+            OpenSignatureBody::Datatype(
+                key(venue().address, "pool", "Pool"),
+                vec![OpenSignatureBody::TypeParameter(0), OpenSignatureBody::TypeParameter(1)],
+            ),
+            Some(Reference::Mutable),
+        )
+    }
+
+    fn definition(parameters: Vec<OpenSignature>, return_: Vec<OpenSignature>) -> FunctionDef {
+        FunctionDef {
+            visibility: Visibility::Public,
+            is_entry: false,
+            type_params: vec![],
+            parameters,
+            return_,
+        }
+    }
+
+    fn probe(definition: &FunctionDef, evidence: EntryEvidence) -> Option<Vec<u16>> {
+        swap_shape("pool", "swap", definition, evidence, Some(&venue()))
+            .map(|entry| entry.asset_type_parameters)
+    }
+
+    #[test]
+    fn an_inter_asset_swap_on_the_venue_is_accepted() {
+        let definition = definition(
+            vec![
+                venue_borrow(),
+                parameter(coin("coin", "Coin", 0), None),
+                parameter(coin("coin", "Coin", 1), None),
+            ],
+            vec![parameter(coin("coin", "Coin", 1), None)],
+        );
+        assert_eq!(probe(&definition, EntryEvidence::StaticScan), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn a_vault_that_moves_one_asset_at_a_time_fails_the_probe() {
+        // `deposit(&mut Pool<T0, T1>, Coin<T0>)`: one leg.
+        let deposit =
+            definition(vec![venue_borrow(), parameter(coin("coin", "Coin", 0), None)], vec![]);
+        assert!(probe(&deposit, EntryEvidence::StaticScan).is_none());
+        // `remove(&mut Pool<T0, T1>) -> (Balance<T0>, Balance<T1>)`: both legs, but nothing is
+        // exchanged — this is what a scan has to reject and an observed call may accept.
+        let remove = definition(
+            vec![venue_borrow()],
+            vec![
+                parameter(coin("balance", "Balance", 0), None),
+                parameter(coin("balance", "Balance", 1), None),
+            ],
+        );
+        assert!(probe(&remove, EntryEvidence::StaticScan).is_none());
+    }
+
+    #[test]
+    fn a_swap_of_another_struct_is_not_this_venues() {
+        let elsewhere = parameter(
+            OpenSignatureBody::Datatype(
+                key(AccountAddress::ONE, "pool", "Pool"),
+                vec![OpenSignatureBody::TypeParameter(0), OpenSignatureBody::TypeParameter(1)],
+            ),
+            Some(Reference::Mutable),
+        );
+        let definition = definition(
+            vec![
+                elsewhere,
+                parameter(coin("coin", "Coin", 0), None),
+                parameter(coin("coin", "Coin", 1), None),
+            ],
+            vec![parameter(coin("coin", "Coin", 1), None)],
+        );
+        assert!(probe(&definition, EntryEvidence::StaticScan).is_none());
+    }
+
+    #[test]
+    fn legs_must_be_type_parameters_of_the_venue_borrow() {
+        // `&mut Pool<T0, T1>` whose coin legs are unrelated `T2`/`T3`: two assets move, but not
+        // the two the venue's own state is generic over.
+        let definition = definition(
+            vec![
+                venue_borrow(),
+                parameter(coin("coin", "Coin", 2), None),
+                parameter(coin("coin", "Coin", 3), None),
+            ],
+            vec![parameter(coin("coin", "Coin", 3), None)],
+        );
+        assert!(probe(&definition, EntryEvidence::StaticScan).is_none());
+    }
+
+    #[test]
+    fn an_observed_script_entry_needs_no_output_leg() {
+        // Cetus's `swap_b2a`: both coins in, the direction in a `bool`, nothing returned — the
+        // shape a static scan must reject as a non-exchange.
+        let definition = definition(
+            vec![
+                venue_borrow(),
+                parameter(coin("coin", "Coin", 0), None),
+                parameter(coin("coin", "Coin", 1), None),
+                parameter(OpenSignatureBody::Bool, None),
+            ],
+            vec![],
+        );
+        assert_eq!(probe(&definition, EntryEvidence::ObservedCall), Some(vec![0, 1]));
+        assert!(probe(&definition, EntryEvidence::StaticScan).is_none());
+    }
+
+    #[test]
+    fn a_venue_without_a_price_variable_fails_the_behavioural_probe() {
+        let evidence = StaticEvidence {
+            swap_entry: None,
+            oracle_references: vec![],
+            functions_examined: 0,
+            coin_functions: vec![],
+        };
+        let verdict = Classifier::default().verdict(
+            &venue(),
+            &evidence,
+            PriceObservation::NoPriceVariable,
+            None,
+        );
+        assert!(!verdict.is_price_discovery_venue());
+        let probe = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "endogenous price state")
+            .unwrap_or_else(|| unreachable!());
+        assert!(!probe.passed);
+        assert!(probe.detail.contains("no price variable"), "{}", probe.detail);
     }
 }

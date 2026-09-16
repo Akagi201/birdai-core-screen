@@ -215,6 +215,7 @@ const fn required_fields(kind: VenueKind) -> &'static [&'static str] {
             "fee_growth_global_a",
             "fee_growth_global_b",
             "tick_manager",
+            "is_pause",
         ],
         VenueKind::VoloNativePool => &["pending", "collectable_fee", "validator_set"],
         VenueKind::NaviStorage => &["reserves", "reserves_count", "user_info"],

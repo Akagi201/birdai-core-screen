@@ -51,7 +51,7 @@ use std::{
 };
 
 use birdai_resolve::{Fingerprint, LayoutSource};
-use birdai_tick::{SkipListHead, Ticks};
+use birdai_tick::{SizeSkew, SkipListHead, Ticks};
 use birdai_venue::{AnyVenue, VenueKind, decode_venue, venue_kind_of};
 use move_core_types::{account_address::AccountAddress, language_storage::StructTag};
 use rayon::prelude::*;
@@ -171,6 +171,8 @@ impl ChildSet {
 pub struct StateManager {
     slots: SccHashMap<ObjectID, Arc<VenueSlot>>,
     children: SccHashMap<ObjectID, ChildSet>,
+    /// Child field id to the parent UID whose set holds it, so a deletion can be routed back.
+    child_owners: SccHashMap<ObjectID, ObjectID>,
     venues_created: AtomicU64,
     venues_updated: AtomicU64,
     venues_removed: AtomicU64,
@@ -209,6 +211,7 @@ impl StateManager {
         Self {
             slots: SccHashMap::new(),
             children: SccHashMap::new(),
+            child_owners: SccHashMap::new(),
             venues_created: AtomicU64::new(0),
             venues_updated: AtomicU64::new(0),
             venues_removed: AtomicU64::new(0),
@@ -535,13 +538,23 @@ impl StateManager {
         }
 
         for id in removed {
-            if self.slots.remove_sync(&id).is_some() {
+            let removed_slot = self.slots.remove_sync(&id).map(|(_key, slot)| slot);
+            if removed_slot.is_some() {
                 self.venues_removed.fetch_add(1, Ordering::Relaxed);
                 report.venues_removed += 1;
             }
-            // A deleted parent's child entries die with it; otherwise a churned pool would
-            // leave its tick ids behind forever.
-            self.children.remove_sync(&id);
+            // A deleted pool takes its child set with it. The set is keyed by the skip list's
+            // *inner* UID, so removing the pool's own id would leave it behind forever.
+            if let Some(slot) = &removed_slot &&
+                let AnyVenue::Cetus(pool) = &slot.venue
+            {
+                self.children.remove_sync(&pool.ticks.node_uid);
+            }
+            // A deleted child leaves the set of the parent it hung off. Tick nodes are burned as
+            // the price moves, so without this every churned tick would stay in the index.
+            if let Some((_key, parent)) = self.child_owners.remove_sync(&id) {
+                self.children.update_sync(&parent, |_key, set| set.field_ids.remove(&id));
+            }
         }
 
         // Children are indexed only for the inner UIDs of tracked Cetus pools. Anything else —
@@ -570,6 +583,9 @@ impl StateManager {
                 let mut dropped = 0_usize;
                 for field_id in field_ids {
                     if set.insert(*field_id) {
+                        // Remember which parent holds it, so a later deletion can be routed back.
+                        // Only recorded for children the set actually kept.
+                        self.child_owners.upsert_sync(*field_id, *parent);
                         inserted += 1;
                     } else if !set.field_ids.contains(field_id) {
                         dropped += 1;
@@ -620,16 +636,18 @@ impl StateManager {
 
     /// Replace a pool's tick index from freshly decoded nodes.
     ///
-    /// The skip list's declared `size` is asserted against the number of nodes decoded: a partial
-    /// page walk is the failure mode that silently misprices every quote, so it is a hard error.
-    /// The nodes are also checked against the tracked pool's spacing grid when the pool is known.
+    /// The skip list's declared `size` is reported as a [`SizeSkew`] rather than asserted: the
+    /// children can only be listed as of the present, so a pool that has traded since the metadata
+    /// was written legitimately has a different number of them, and a page walk that hit its cap
+    /// looks identical from here. Every other invariant — key order, link integrity, the stored
+    /// prices — is still enforced, and the skew is returned so the caller can report it.
     pub fn install_ticks(
         &self,
         id: ObjectID,
         head: &SkipListHead,
         nodes: impl IntoIterator<Item = birdai_tick::TickNode>,
-    ) -> Result<Arc<Ticks>, StateError> {
-        let ticks = Ticks::new(Some(head.node_uid), Some(head.size), nodes)?;
+    ) -> Result<(Arc<Ticks>, Option<SizeSkew>), StateError> {
+        let (ticks, skew) = Ticks::from_children(Some(head.node_uid), head.size, nodes)?;
         if let Some(slot) = self.venue(&id) &&
             let AnyVenue::Cetus(pool) = &slot.venue
         {
@@ -639,7 +657,7 @@ impl StateManager {
         if !self.set_ticks(id, ticks.clone()) {
             return Err(StateError::UnknownVenue(id.to_canonical_string(true)));
         }
-        Ok(ticks)
+        Ok((ticks, skew))
     }
 }
 

@@ -127,11 +127,16 @@ impl CetusClmm {
         }
     }
 
-    /// True when a quote of `amount_in` would stay inside the current tick range.
+    /// True when a quote of `amount_in` would stay inside the tick the pool is in right now.
     ///
-    /// This is the check that makes a single-step quote exact without consulting the tick index:
-    /// consecutive initialised ticks are at least `tick_spacing` apart, so a price move of less
-    /// than `tick_spacing` ticks cannot reach one.
+    /// This is the check that makes a single-step quote exact without consulting the tick index.
+    /// Initialised ticks sit on multiples of `tick_spacing` and the pool's stored tick is the floor
+    /// tick of its current price, so if the reached price floors to the *same* tick then no
+    /// integer tick — and therefore no boundary — lies between the two prices.
+    ///
+    /// `tick_spacing` on its own is not enough: from tick 71 162 the next multiple of 10 is 71 170,
+    /// eight ticks away, so a move of nine ticks would cross a boundary that a "less than
+    /// `tick_spacing`" test calls safe.
     pub fn stays_inside_current_range(
         &self,
         direction: Direction,
@@ -149,8 +154,29 @@ impl CetusClmm {
                 birdai_amm::next_sqrt_price_down(self.sqrt_price, self.liquidity, net)?
             }
         };
-        let reached_tick = birdai_amm::tick_at_sqrt_price(reached)?;
-        Ok((reached_tick - self.tick).abs() < self.tick_spacing as i32)
+        // The argument needs the stored tick to be the floor tick of the stored price. A pool whose
+        // bookkeeping disagrees with its price gets no shortcut: the tick index has to be used.
+        let start = birdai_amm::tick_at_sqrt_price(self.sqrt_price)?;
+        if start != self.tick {
+            return Ok(false);
+        }
+        Ok(birdai_amm::tick_at_sqrt_price(reached)? == start)
+    }
+
+    /// The first initialised tick at or above `self.tick`, as the spacing grid implies it.
+    ///
+    /// Every initialised tick is a multiple of `tick_spacing`, so this is the nearest boundary the
+    /// price can meet — without enumerating the skip list, and therefore without reading the tick
+    /// set at a version it cannot be read at.
+    #[must_use]
+    pub const fn next_grid_tick(&self) -> i32 {
+        let spacing = self.tick_spacing as i32;
+        if spacing <= 0 {
+            return self.tick;
+        }
+        // Euclidean division, so this holds for negative ticks too.
+        let floor = self.tick.div_euclid(spacing);
+        floor.saturating_add(1).saturating_mul(spacing)
     }
 }
 
@@ -234,7 +260,9 @@ impl<'b, 'l> StructDecoder<'b, 'l> for CetusPoolDecoder {
             fee_protocol_coin_a: fee_protocol_coin_a.unwrap_or(0),
             fee_protocol_coin_b: fee_protocol_coin_b.unwrap_or(0),
             ticks: required(ticks, "tick_manager")?,
-            is_paused: is_paused.unwrap_or(false),
+            // Required rather than defaulted: `is_priceable` gates on it, and a pool that halts
+            // swaps while we price it as live is the one failure mode this field exists to stop.
+            is_paused: required(is_paused, "is_pause")?,
             index: index.unwrap_or(0),
             url: url.unwrap_or_default(),
         })

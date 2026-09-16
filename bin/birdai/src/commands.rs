@@ -8,7 +8,9 @@ use birdai_amm::{
 use birdai_resolve::fixture::Fixtures;
 use birdai_state::StateManager;
 use birdai_tick::{SizeSkew, Ticks};
-use birdai_venue::{AnyVenue, CetusClmm, Classifier, Venue, price_state_change, venue_kind_of};
+use birdai_venue::{
+    AnyVenue, CetusClmm, Classifier, Venue, Verdict, price_state_change, venue_kind_of,
+};
 use move_core_types::account_address::AccountAddress;
 use prometheus::Registry;
 use sui_indexer_alt_framework::ingestion::{
@@ -30,7 +32,7 @@ use crate::{
         POOL_A_TYPE, POOL_B, POOL_C, POOL_SCRIPT_PACKAGE, TX_T, TX_T_AMOUNT_IN, TX_T_AMOUNT_OUT,
         TX_T_CHECKPOINT, object_id,
     },
-    session::Session,
+    session::{Decoded, Session},
     ticks::load_tick_nodes,
 };
 
@@ -181,11 +183,13 @@ async fn load_tick_snapshot(
 /// Apply the price-discovery test to A, B and C.
 pub(crate) async fn classify(session: &Session) -> eyre::Result<()> {
     let classifier = Classifier::default();
+    let mut verdicts: Vec<Verdict> = Vec::new();
 
     // Object A gets the behavioural probe too: two versions of the pool bracketing transaction T.
     rule("object A — Cetus CLMM pool");
     let before = load_pool(session, Some(POOL_A_PRE_VERSION)).await?;
     let after = load_pool(session, Some(POOL_A_POST_VERSION)).await?;
+    let decoded = session.decode(object_id(POOL_A)?, Some(POOL_A_POST_VERSION)).await?;
     let checkpoint = session.checkpoint(TX_T_CHECKPOINT).await?;
     let digest: TransactionDigest =
         TX_T.parse().map_err(|error| eyre::eyre!("bad transaction digest {TX_T}: {error}"))?;
@@ -196,26 +200,50 @@ pub(crate) async fn classify(session: &Session) -> eyre::Result<()> {
         .ok_or_else(|| eyre::eyre!("transaction {TX_T} is not in checkpoint {TX_T_CHECKPOINT}"))?;
     let inputs: Vec<&sui_types::object::Object> =
         transaction.input_objects(&checkpoint.object_set).collect();
+    let expected_inputs = transaction
+        .effects
+        .object_changes()
+        .iter()
+        .filter(|change| change.input_version.is_some())
+        .count();
     let change = price_state_change(&before, &after, &inputs, classifier.deny_set());
-    println!("  input objects: {}", inputs.len());
-    println!("  oracle-ish inputs: {:?}", change.oracle_inputs);
+    println!("  input objects: {} of {expected_inputs} present in the object set", inputs.len());
+    println!("  oracle-shaped inputs: {:?}", change.oracle_inputs);
     println!("  coin_a about to be spent: {} -> {}", before.coin_a, after.coin_a);
     println!("  fee_rate {} ({} bps)", before.fee_rate, before.fee_rate / 100);
     println!("  what the chain actually called:");
     let mut observed = None;
     for (index, package, module, function) in transaction.transaction.move_calls() {
-        let entry = classifier
-            .entry_at(session.layouts.as_ref(), AccountAddress::from(*package), module, function)
-            .await?;
+        // Anchored on pool A's own tag: a call that does not mutably borrow this pool is reported
+        // as such rather than being mistaken for its swap.
+        let entry = match classifier
+            .entry_at(
+                session.layouts.as_ref(),
+                &decoded.tag,
+                AccountAddress::from(*package),
+                module,
+                function,
+            )
+            .await
+        {
+            Ok(entry) => entry,
+            Err(error) => {
+                println!(
+                    "    [{index}] {}::{module}::{function} (not resolvable: {error})",
+                    package.to_canonical_string(true)
+                );
+                continue;
+            }
+        };
         println!(
             "    [{index}] {}::{module}::{function} {}",
             package.to_canonical_string(true),
             match &entry {
                 Some(entry) => format!(
-                    "← inter-asset swap shape, asset legs on type parameters {:?}",
+                    "← inter-asset swap on this pool, asset legs on type parameters {:?}",
                     entry.asset_type_parameters
                 ),
-                None => String::from("(not an inter-asset swap shape)"),
+                None => String::from("(not an inter-asset swap of this pool's own assets)"),
             }
         );
         if entry.is_some() && observed.is_none() {
@@ -232,60 +260,70 @@ pub(crate) async fn classify(session: &Session) -> eyre::Result<()> {
         );
     }
 
-    let decoded = session.decode(object_id(POOL_A)?, Some(POOL_A_POST_VERSION)).await?;
     let verdict = classifier
         .classify_object(
             session.layouts.as_ref(),
             &decoded.object,
+            after.price_state(),
             Some(&change),
             observed.as_ref(),
         )
         .await?;
     print!("{}", verdict.render());
+    verdicts.push(verdict);
 
     for (label, id) in [("object B — Volo NativePool", POOL_B), ("object C — Navi Storage", POOL_C)]
     {
         rule(label);
         let decoded = session.decode(object_id(id)?, None).await?;
+        let price_state = match typed_venue(&decoded) {
+            Ok(venue) => {
+                println!(
+                    "  typed as {}; its own fields carry {}",
+                    venue.kind().label(),
+                    if venue.price_state().is_some() {
+                        "a price variable"
+                    } else {
+                        "no price variable"
+                    }
+                );
+                venue.price_state()
+            }
+            Err(error) => {
+                println!("  this crate cannot type it ({error})");
+                None
+            }
+        };
         let verdict = classifier
-            .classify_object(session.layouts.as_ref(), &decoded.object, None, None)
+            .classify_object(session.layouts.as_ref(), &decoded.object, price_state, None, None)
             .await?;
         print!("{}", verdict.render());
-        if let Some(kind) = venue_kind_of(&decoded.tag) {
-            println!("  kind: {} → {}", kind.label(), kind.has_on_chain_price_discovery());
-        }
+        verdicts.push(verdict);
     }
 
+    // The summary says what the probes concluded, not what they were expected to conclude.
     rule("summary");
-    println!("A  TRADING VENUE with on-chain price discovery — all three probes pass:");
-    println!("     · the entry the chain executed, `pool_script_v2::swap_b2a`, mutably borrows");
-    println!("       `Pool<T0, T1>` and carries coin legs on both of its type parameters;");
-    println!("     · across T the pool's own `current_sqrt_price` rose while `coin_b` rose and");
-    println!("       `coin_a` fell, with no oracle among the {} input objects;", inputs.len());
-    println!("     · neither the pool's type nor its package links a price feed.");
-    println!();
-    println!(
-        "B  NOT a venue — `NativePool` has no type parameters, so no function can take two of"
-    );
-    println!(
-        "     its own assets and give the other back; the SUI↔VSUI rate is an accounting ratio"
-    );
-    println!("     that moves with reward accrual, and the object holds no price state at all.");
-    println!();
-    println!(
-        "C  NOT a venue — `Storage` has no type parameters either, so the same clause rejects"
-    );
-    println!(
-        "     every entry unconditionally (`deposit`/`withdraw`/`borrow`/`repay` each move one"
-    );
-    println!("     asset against a share claim); the package statically links an oracle");
-    println!(
-        "     (`PriceOracle` reached from `lending`, `logic`, `calculator`, `dynamic_calculator`);"
-    );
-    println!(
-        "     and the object holds no price state — its 155 bytes are versions, tables and counts."
-    );
+    for verdict in &verdicts {
+        let failed: Vec<&str> =
+            verdict.probes.iter().filter(|probe| !probe.passed).map(|probe| probe.name).collect();
+        if failed.is_empty() {
+            println!("{} — trading venue with on-chain price discovery (3/3)", verdict.tag);
+        } else {
+            println!("{} — not a venue: failed {}", verdict.tag, failed.join(", "));
+        }
+    }
     Ok(())
+}
+
+/// Type an object with this crate's venue decoders, if its layout has that shape.
+fn typed_venue(decoded: &Decoded) -> Result<AnyVenue, birdai_venue::VenueError> {
+    let contents = decoded
+        .object
+        .data
+        .try_as_move()
+        .ok_or_else(|| birdai_venue::VenueError::UnknownVenue(String::from("not a Move object")))?
+        .contents();
+    birdai_venue::decode_venue(contents, &decoded.tag, &decoded.layout)
 }
 
 /// Recompute transaction T's output from the pool state it consumed.
@@ -406,16 +444,19 @@ pub(crate) async fn reproduce(session: &Session) -> eyre::Result<()> {
     );
 
     let crossing = above.is_some_and(|node| result.sqrt_price_end >= node.tick.sqrt_price);
-    let spacing_proof = pool.stays_inside_current_range(Direction::BtoA, TX_T_AMOUNT_IN)?;
+    let grid = pool.next_grid_tick();
+    let inside = pool.stays_inside_current_range(Direction::BtoA, TX_T_AMOUNT_IN)?;
     println!("\nwhy one step, with no tick crossed");
     println!(
-        "  the move is {:.3} ticks, and tick_spacing is {}",
+        "  the move is {:.3} ticks; the next spacing multiple above is {grid}, {} ticks away",
         move_in_ticks(pool.sqrt_price, result.sqrt_price_end),
-        pool.tick_spacing
+        grid - pool.tick
     );
     println!(
-        "  a move below tick_spacing cannot reach another initialised tick: {}",
-        spacing_proof
+        "  the reached price floors to the same tick ({} → {}): {}",
+        pool.tick,
+        birdai_amm::tick_at_sqrt_price(result.sqrt_price_end)?,
+        inside
     );
     println!("  and the price stays below the next boundary above: {}", !crossing);
     println!(
@@ -503,10 +544,23 @@ pub(crate) async fn calibrate(session: &Session) -> eyre::Result<()> {
 pub(crate) async fn follow(
     session: &Session,
     rpc_url: &str,
-    from: u64,
+    from: Option<u64>,
     count: u64,
 ) -> eyre::Result<()> {
+    if session.is_offline() {
+        return follow_fixtures(session, from, count).await;
+    }
+
     rule("streaming checkpoints");
+    // Without `--from`, start where the chain is: a follower that starts at a historical checkpoint
+    // has to backfill before it is current, which is not what "keep this state current" means.
+    let from = if let Some(from) = from {
+        from
+    } else {
+        let latest = session.objects.latest_checkpoint().await?;
+        println!("no --from: starting at the node's latest checkpoint {latest}");
+        latest
+    };
     let uri: http::Uri = rpc_url.parse()?;
     let args = ClientArgs {
         ingestion: IngestionClientArgs {
@@ -561,7 +615,16 @@ pub(crate) async fn follow(
                 .await
                 {
                     Ok(nodes) => match manager.install_ticks(slot.id, &pool.ticks, nodes) {
-                        Ok(ticks) => println!("  {} ticks {} loaded", slot.id, ticks.len()),
+                        Ok((ticks, skew)) => println!(
+                            "  {} ticks {} loaded{}",
+                            slot.id,
+                            ticks.len(),
+                            skew.map_or_else(String::new, |skew| format!(
+                                " (declared {}, skew {})",
+                                skew.declared,
+                                skew.delta()
+                            ))
+                        ),
                         Err(error) => println!("  {} ticks failed: {error:#}", slot.id),
                     },
                     Err(error) => println!("  {} ticks failed: {error:#}", slot.id),
@@ -579,6 +642,53 @@ pub(crate) async fn follow(
         );
     }
 
+    print_final_state(&manager, session, seen);
+    Ok(())
+}
+
+/// The same state layer, driven by the captured checkpoint set instead of a stream.
+///
+/// The fixture set is a closed range, so there is nothing to "keep current" here: this replays what
+/// was captured and prints the resulting state, which is what makes the offline run exercise the
+/// same `apply_checkpoint` the live one does.
+async fn follow_fixtures(session: &Session, from: Option<u64>, count: u64) -> eyre::Result<()> {
+    rule("replaying captured checkpoints");
+    let captured = session.fixture_checkpoints();
+    let start = from.unwrap_or_else(|| captured.first().copied().unwrap_or(0));
+    let manager = StateManager::new();
+    let mut applied = 0_u64;
+    let mut seen = 0_u64;
+    for sequence in captured.iter().filter(|sequence| **sequence >= start) {
+        let checkpoint = session.checkpoint(*sequence).await?;
+        let report = manager.apply_checkpoint(session.layouts.as_ref(), &checkpoint).await?;
+        seen += 1;
+        println!(
+            "cp {:<12} venues {} (+{} new, -{}), children +{}, packages {}, skipped {}, failed {}",
+            report.checkpoint,
+            report.venues_updated,
+            report.venues_created,
+            report.venues_removed,
+            report.children_indexed,
+            report.packages_observed,
+            report.unrecognised,
+            report.failures
+        );
+        if report.venues_updated > 0 {
+            applied += 1;
+        }
+        if applied >= count {
+            break;
+        }
+    }
+    if seen == 0 {
+        return Err(eyre::eyre!("no captured checkpoint at or after {start}"));
+    }
+    print_final_state(&manager, session, seen);
+    Ok(())
+}
+
+/// What the state manager holds after the run.
+fn print_final_state(manager: &StateManager, session: &Session, seen: u64) {
     rule("final state");
     let stats = manager.stats();
     println!("checkpoints seen  {seen}");
@@ -596,7 +706,6 @@ pub(crate) async fn follow(
     if let Some(registry) = session.registry() {
         println!("\nlayout cache: {:?}", registry.stats());
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -705,9 +814,10 @@ pub(crate) async fn fetch(session: &Session, out: &std::path::Path) -> eyre::Res
         let (tag, layout) = entry;
         let canonical = session.layouts.canonical(&tag).await?;
         addresses.insert(canonical.address);
-        for (address, _version) in
-            birdai_resolve::layout::collect_dependencies(&layout, &std::collections::HashMap::new())
-        {
+        for (address, _version) in birdai_resolve::layout::collect_dependencies(
+            &layout,
+            &birdai_resolve::PackageVersions::default(),
+        ) {
             addresses.insert(address);
         }
         fixtures.record_layout(&tag, &canonical, &layout)?;
